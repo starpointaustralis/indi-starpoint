@@ -136,4 +136,30 @@ class StarpointFocuser : public INDI::Focuser
         INDI::PropertyNumber TemperatureOffsetNP {1};
         INDI::PropertyNumber TemperatureCalibrationNP {1};
         INDI::PropertySwitch TemperatureOffsetClearSP {1};
+
+        // A focuser for simulation mode. It answers the same commands as the real focuser.
+        class Simulator{
+            public:
+                std::string reply(const std::string &command);
+
+            private:
+                void update();
+                std::string ack(bool ok, const char *error = nullptr) const;
+
+                int32_t m_Position {10000};
+                int32_t m_Target {10000};
+                int32_t m_Min {0};
+                int32_t m_Max {25000};
+                int m_Speed {180};
+                int m_Direction {1};
+                int m_LED {10};
+                double m_TemperatureOffset {0};
+                bool m_Moving {false};
+                double m_Travelled {0};
+                std::chrono::steady_clock::time_point m_MoveStartedAt;
+                std::chrono::steady_clock::time_point m_UpdatedAt;
+                std::chrono::steady_clock::time_point m_CreatedAt {std::chrono::steady_clock::now()};
+        };
+
+        Simulator m_Simulator;
 };

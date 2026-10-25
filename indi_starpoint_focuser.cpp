@@ -281,6 +281,9 @@ bool StarpointFocuser::initProperties()
     TemperatureOffsetClearSP[0].fill("CLEAR", "Clear offset", ISS_OFF);
     TemperatureOffsetClearSP.fill(getDeviceName(), "TEMPERATURE_OFFSET_CLEAR", "Temperature Offset", OPTIONS_TAB, IP_RW,ISR_ATMOST1, 60, IPS_IDLE);
 
+    // Debug, simulation and configuration controls
+    addAuxControls();
+
     return true;
 }
 
@@ -403,11 +406,14 @@ bool StarpointFocuser::ISNewSwitch(const char *dev, const char *name, ISState *s
 
 bool StarpointFocuser::Handshake()
 {
-    const std::string port = serialConnection->port();
+    const std::string port = isSimulation() ? std::string("simulator") : std::string(serialConnection->port());
 
-    std::this_thread::sleep_for(BOOT_DRAIN);
-    discardInput();
-
+    if (!isSimulation())
+    {
+        std::this_thread::sleep_for(BOOT_DRAIN);
+        discardInput();
+    }
+    
     for (int attempt = 1; ; attempt++)
     {
         std::string reply;
@@ -633,6 +639,13 @@ bool StarpointFocuser::SetFocuserSpeed(int speed)
 StarpointFocuser:: Exchange StarpointFocuser::exchange(const std::string &command, std::string &reply)
 {
     reply.clear();
+    if (isSimulation())
+    {
+        LOGF_DEBUG("Sent [%s]", command.c_str());
+        reply = m_Simulator.reply(command);
+        LOGF_DEBUG("received [%s]", reply.c_str());
+        return Exchange::OK;
+    }
     discardInput();
 
     if (!sendWithoutReply(command))
@@ -731,6 +744,8 @@ bool StarpointFocuser::sendCommand(const std::string &command)
 bool StarpointFocuser::sendWithoutReply(const std::string &command)
 {
     LOGF_DEBUG("Sent [%s]", command.c_str());
+    if (isSimulation())
+        return true;
 
     int written = 0;
     const int rc = tty_write_string(PortFD, command.c_str(), &written);
@@ -1162,4 +1177,177 @@ bool StarpointFocuser::setTemperatureOffset(double offset)
     m_TemperatureReadAt = {};
     LOGF_INFO("Temperature offset set to %s °C.", formatOffset(offset).c_str());
     return true;
+}
+
+std::string StarpointFocuser::Simulator::reply(const std::string &command)
+{
+    update();
+
+    const std::string body = withoutTerminator(command);
+    const auto now = std::chrono::steady_clock::now();
+
+    // Commands that set something carry a number after their name
+    double value = 0;
+    auto valueAfter = [&body, &value](const char *name)
+    {
+        const size_t length = strlen(name);
+        if (body.size() <= length || body.compare(0, length, name) != 0)
+            return false;
+        char *end = nullptr;
+        value = std::strtod(body.c_str() + length, &end);
+        return *end == '\0';
+    };
+
+    if (body == "PING?")
+        return FOCUSER_REPLY;
+
+    if (body == "CONFIG?")
+    {
+        const json config =
+        {
+            {"model", "Simulator"}, {"deviceName", "Simulated focuser"}, {"fw", "simulator"},
+            {"pos", m_Position}, {"min", m_Min}, {"max", m_Max},
+            {"speed", m_Speed}, {"dir", m_Direction}, {"led", m_LED}, {"tempOffsetC", m_TemperatureOffset}
+        };
+        return config.dump();
+    }
+
+    if (body == "POS?")
+        return std::to_string(m_Position);
+
+    if (body == "MOVING?")
+        return m_Moving ? "1" : "0";
+
+    if (body == "TEMP?")
+    {
+        // Drifts by up to a degree over an hour so changes can be seen
+        const double hours = std::chrono::duration<double>(now - m_CreatedAt).count() / 3600;
+        const double celsius = 12.5 + std::sin(hours * 2 * 3.14159265358979) + m_TemperatureOffset;
+        const json temperature = {{"available", true}, {"tempC", std::round(celsius * 100) / 100}};
+        return temperature.dump();
+    }
+
+    if (body == "HALT")
+    {
+        m_Target = m_Position;
+        m_Moving = false;
+        return ack(true);
+    }
+
+    if (valueAfter("MOVEREL"))
+    {
+        m_Target = static_cast<int32_t>(std::clamp<double>(m_Position + value, m_Min, m_Max));
+        m_MoveStartedAt = now;
+        return ack(true);
+    }
+
+    if (valueAfter("MOVE"))
+    {
+        if (value < m_Min || value > m_Max)
+            return ack(false, "range");
+        m_Target = static_cast<int32_t>(value);
+        m_MoveStartedAt = now;
+        return ack(true);
+    }
+
+    if (valueAfter("SYNC"))
+    {
+        if (m_Moving)
+            return ack(false, "busy");
+        if (value < m_Min || value > m_Max)
+            return ack(false, "range");
+        m_Position = m_Target = static_cast<int32_t>(value);
+        return ack(true);
+    }
+
+    if (valueAfter("MIN"))
+    {
+        if (value < 0 || value >= m_Max)
+            return ack(false, "range");
+        m_Min = static_cast<int32_t>(value);
+        return ack(true);
+    }
+
+    if (valueAfter("MAX"))
+    {
+        if (value <= m_Min)
+            return ack(false, "range");
+        m_Max = static_cast<int32_t>(value);
+        return ack(true);
+    }
+
+    if (valueAfter("DIR"))
+    {
+        if (value != 1 && value != -1)
+            return ack(false, "range");
+        m_Direction = static_cast<int>(value);
+        return ack(true);
+    }
+
+    if (valueAfter("SPEED"))
+    {
+        if (value < MIN_SPEED || value > MAX_SPEED)
+            return ack(false, "range");
+        m_Speed = static_cast<int>(value);
+        return ack(true);
+    }
+
+    if (valueAfter("LED"))
+    {
+        if (value < 0 || value > 255)
+            return ack(false, "range");
+        m_LED = static_cast<int>(value);
+        return ack(true);
+    }
+
+    if (valueAfter("TEMPOFFSET"))
+    {
+        if (std::fabs(value) > MAX_TEMPERATURE_OFFSET)
+            return ack(false, "range");
+        m_TemperatureOffset = value;
+        return ack(true);
+    }
+
+    return ack(false, "unsupported");
+}
+
+void StarpointFocuser::Simulator::update()
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (m_Position == m_Target)
+    {
+        m_Moving = false;
+        return;
+    }
+
+    if (!m_Moving)
+    {
+        if (now - m_MoveStartedAt < std::chrono::milliseconds(300))
+            return;
+        m_Moving = true;
+        m_UpdatedAt = now;
+        m_Travelled = 0;
+    }
+
+    m_Travelled += m_Speed * 2000.0 / 180 * std::chrono::duration<double>(now - m_UpdatedAt).count();
+    m_UpdatedAt = now;
+    const int32_t steps = static_cast<int32_t>(m_Travelled);
+    m_Travelled -= steps;
+
+    const int32_t remaining = m_Target - m_Position;
+    if (std::abs(remaining) <= steps)
+    {
+        m_Position = m_Target;
+        m_Moving = false;
+    }
+    else
+        m_Position += remaining > 0 ? steps : -steps;
+}
+
+std::string StarpointFocuser::Simulator::ack(bool ok, const char *error) const
+{
+    json reply = {{"ok", ok}};
+    if (error != nullptr)
+        reply["error"] = error;
+    return reply.dump();
 }
