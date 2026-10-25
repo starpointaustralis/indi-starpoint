@@ -1,5 +1,5 @@
-# Starpoint Australis SP3 Focuser INDI Driver
-This repository contains the **INDI driver** for the SP3 Focuser, produced by Starpoint Australis.
+# Starpoint Australis Focuser INDI Driver
+This repository contains the **INDI driver** for the Starpoint Australis Focuser.
 It allows KStars/Ekos and any INDI-compatible automation system to control the focuser over USB.
 
 <img width="4000" height="3000" alt="SP3" src="https://github.com/user-attachments/assets/0b0680c9-8c98-4680-8334-1c64d935eb63" />
