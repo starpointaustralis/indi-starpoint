@@ -21,80 +21,119 @@
 
 #pragma once
 
-#include "libindi/indifocuser.h"
-#include "libindi/connectionplugins/connectionserial.h"
-#include "libindi/indicom.h"
+#include "indifocuser.h"
 
-#include <mutex>
+#include <chrono>
+#include <cstdint>
 #include <string>
 
-namespace Connection { class Serial; }
-
+/**
+* Starpoint Australis focusers over USB serial. Commands and replies are ASCII text
+* ending in '#'; commands that change something are answered with a JSON acknowledgement,
+* {"ok":true} or {"ok":false,"error":"..."}
+*/
 class StarpointFocuser : public INDI::Focuser
 {
-public: 
-    StarpointFocuser();
-    virtual ~StarpointFocuser() = default;
+    public:
+        StarpointFocuser();
+        virtual ~StarpointFocuser() override = default;
 
-    // Identity
-    virtual const char *getDefaultName() override;
+        virtual const char *getDefaultName() override;
+        virtual bool initProperties() override;
+        virtual bool updateProperties() override;
 
-    // Properties
-    virtual bool initProperties() override;
-    virtual bool updateProperties() override;
+        virtual bool ISNewNumber(const char *dev, const char *name, double values[], char *names[], int n) override;
+        virtual bool ISNewSwitch(const char *dev, const char *name, ISState *states, char *names[], int n) override;
 
-    virtual void TimerHit() override;
+    protected:
+        virtual bool Handshake() override;
+        virtual bool Disconnect() override;
+        virtual void TimerHit() override;
 
-protected:
-    virtual bool Handshake() override;
-    virtual bool SyncFocuser(uint32_t ticks) override;
-    virtual IPState MoveAbsFocuser(uint32_t targetTicks) override;
-    virtual IPState MoveRelFocuser(FocusDirection dir, uint32_t ticks) override;
-    virtual bool AbortFocuser() override;
-    virtual bool SetFocuserMaxPosition(uint32_t ticks) override;
+        virtual bool saveConfigItems(FILE *fp) override;
 
-private:
-    // Write-only
-    bool sendCommand(const char *cmd);
+        virtual IPState MoveAbsFocuser(uint32_t targetTicks) override;
+        virtual IPState MoveRelFocuser(FocusDirection dir, uint32_t ticks) override;
+        virtual bool SyncFocuser(uint32_t ticks)override;
+        virtual bool AbortFocuser() override;
+        virtual bool ReverseFocuser(bool enabled) override;
+        virtual bool SetFocuserSpeed(int speed) override;
 
-    // Write + optional read (until terminator)
-    bool sendCommand(const char *cmd,
-                     std::string &response,
-                     bool expectResponse = true,
-                     char terminator = '#',
-                     int timeoutSec = 2,
-                     size_t maxLen = 512);
+    private:
+        enum class Exchange
+        {
+            OK,
+            TIMEOUT,
+            FAILED
+        };
 
-    // Serial helpers
-    bool writeRaw(const char *buf);
-    bool readUntil(std::string &out, char terminator = '#', int timeoutSec = 2, size_t maxLen = 512);
-    static void trim(std::string &s);
+        // Talking to the focuser. One command is in flight at a time, and each command is
+        // sent and its reply read in a single call. Each sets m_LastError if it fails.
+        Exchange exchange(const std::string &command, std::string &reply);
+        bool query(const std::string &command, std::string &reply);
+        bool queryInteger(const std::string &command, int32_t &value);
+        bool sendCommand(const std::string &command);
+        bool sendWithoutReply(const std::string &command);
+        void discardInput();
+        Exchange readReply(std::string &reply);
 
-    // Hardware calls
-    bool hwProbe();
-    bool hwSerialNumber(std::string& serialOut);
-    bool hwReadPosition(uint32_t &pos);
-    bool hwMoveAbsolute(uint32_t position);
-    bool hwMoveRelative(FocusDirection dir, uint32_t ticks);
-    bool hwIsMoving(bool &moving);
-    bool hwReadTemperature(double &temp);
-    bool hwSetMaxPosition(uint32_t ticks);
+        // Focuser state
+        bool readConfig();
+        bool readTemperature();
+        bool poll();
+        void pollFailed();
+        bool isMoving() const;
+        void updateLimitProperties();
+        bool setLimits(int32_t minimum, int32_t maximum);
+        bool setLED(int index);
+        bool calibrateTemperature(double actual);
+        bool setTemperatureOffset(double offset);
 
-    bool m_isMoving{false};
-    bool Ack();
 
-    static std::vector<std::string_view> split_sv(std::string_view s, char delim = '%');
-    static std::string_view trim_sv(std::string_view sv);
-    static bool to_double(std::string_view sv, double& out);
-    static bool to_u32(std::string_view sv, uint32_t& out, int base = 10);
+        std::string m_LastError;
+        bool m_LastRefused {false};
 
-    std::mutex ioMutex;
+        int32_t m_Position {0};
+        bool m_ReportedMoving {false};
+        bool m_Halted {false};
+        std::chrono::steady_clock::time_point m_MoveCommandedAt;
+        std::chrono::steady_clock::time_point m_LastPollAt;
+        std::chrono::steady_clock::time_point m_TemperatureReadAt;
+        int m_FailedPolls {0};
+        int m_TimerID {-1};
+        int32_t m_Target {0};
+        int32_t m_MinPosition {0};
+        int32_t m_MaxPosition {0};
 
-    INDI::PropertyNumber TemperatureNP {1};
-    INDI::PropertyText FirmwareTP {2};
-    enum
-    {
-        SERIAL_NUMBER,
-        FIRMWARE_VERSION
-    };
+        bool m_HasTemperature {false};
+        double m_Temperature {0};
+        double m_TemperatureOffset {0};
+
+        bool m_HasLED {false};
+        bool m_HasTemperatureOffset {false};
+
+        INDI::PropertyNumber TemperatureNP {1};
+        bool m_TemperatureDefined {0};
+
+        INDI::PropertyNumber FocusMinPosNP {1};
+
+        INDI::PropertyText DeviceInfoTP {3};
+        enum
+        {
+            INFO_MODEL,
+            INFO_FIRMWARE,
+            INFO_NAME
+        };
+
+        INDI::PropertySwitch LEDSP {4};
+        enum{
+            LED_OFF,
+            LED_LOW,
+            LED_MEDIUM,
+            LED_HIGH
+        };
+
+        INDI::PropertyNumber TemperatureOffsetNP {1};
+        INDI::PropertyNumber TemperatureCalibrationNP {1};
+        INDI::PropertySwitch TemperatureOffsetClearSP {1};
 };

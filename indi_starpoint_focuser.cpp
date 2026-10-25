@@ -19,45 +19,267 @@
 
 */
 
-#include "config.h"
 #include "indi_starpoint_focuser.h"
 
-#include <cstring>
-#include <vector>
-#include <cctype>
+#include "config.h"
+#include "indicom.h"
+#include "indicontroller.h"
+#include "connectionplugins/connectionserial.h"
+
+#ifdef _USE_SYSTEM_JSONLIB
+#include <nlohmann/json.hpp>
+#else
+#include <indijson.hpp>
+#endif
+
 #include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <iterator>
 #include <memory>
-#include <charconv>
-#include <string_view>
+#include <regex>
 #include <thread>
-#include <chrono>
+
+#include <strings.h>
+
+using json = nlohmann::json;
+
+namespace
+{
+    // Serial protocol timing
+    constexpr auto BOOT_DRAIN = std::chrono::milliseconds(200);
+    constexpr auto REPLY_TIMEOUT = std::chrono::seconds(2);
+    constexpr int QUERY_ATTEMPTS = 3;
+    constexpr auto RETRY_DELAY = std::chrono::milliseconds(200);
+    constexpr int HANDSHAKE_ATTEMPTS = 5;
+    constexpr auto HANDSHAKE_RETRY_DELAY = std::chrono::seconds(1);
+    constexpr size_t MAX_REPLY_LENGTH = 4096;
+
+    // Polling
+    constexpr uint32_t POLL_TICK_MS = 250;
+    constexpr uint32_t IDLE_POLL_MS = 2000;
+    constexpr auto MOVE_START_GRACE = std::chrono::seconds(1);
+    constexpr auto TEMPERATURE_INTERVAL = std::chrono::seconds(5);
+    constexpr int FAILED_POLLS_BEFORE_LOST = 3;
+
+    const std::string FOCUSER_REPLY = "FOUND1982";
+
+    // LED brightness as the firmware's raw values: Off, Low, Medium, High
+    constexpr int LED_LEVELS[] = {0, 10, 80, 150};
+
+    constexpr int MIN_SPEED = 1;
+    constexpr int MAX_SPEED = 255;
+    constexpr double MAX_TEMPERATURE_OFFSET = 20;
+
+    std::string withoutTerminator(const std::string &command)
+    {
+        return (!command.empty() && command.back() == '#') ? command.substr(0, command.size() - 1) : command;
+    }
+
+    std::string trim(const std::string &text)
+    {
+        const auto first = text.find_first_not_of(" \t");
+        if (first == std::string::npos)
+            return std::string();
+        return text.substr(first, text.find_last_not_of(" \t") - first + 1);
+    }
+
+    // Raw device text for debug logs, with line breaks and other control characters made visible
+    std::string printable(const std::string &text)
+    {
+        std::string result;
+        for (unsigned char c : text)
+        {
+            if (c == '\r')
+                result += "\\r";
+            else if (c == '\n')
+                result += "\\n";
+            else if (c < 0x20 || c == 0x7F)
+                result += '?';
+            else
+                result += static_cast<char>(c);
+        }
+        return result;
+    }
+
+    // What a refused command means in plain English
+    std::string explainRefusal(const std::string &error)
+    {
+        if (error == "range")
+            return "The focuser rejected the value as out of range.";
+        if (error == "unsupported")
+            return "The focuser's firmware does not support this command.";
+        if (error == "security_required")
+            return "The focuser requires Bluetooth pairing before this can be used.";
+        if (error == "busy")
+            return "The focuser is busy and refused the command. Try again in a moment.";
+        return "The focuser refused the command.";
+    }
+
+    // Reads an acknowledgement. Returns false if the reply is not one.
+    bool parseAck(const std::string &reply, bool &ok, std::string &error)
+    {
+        if (reply.empty() || reply.front() != '{')
+            return false;
+
+        try
+        {
+            const json doc = json::parse(reply);
+            if (!doc.is_object())
+                return false;
+
+            const auto okField = doc.find("ok");
+            if (okField == doc.end() || !okField->is_boolean())
+                return false;
+
+            ok = okField->get<bool>();
+            const auto errorField = doc.find("error");
+            error = (errorField != doc.end() && errorField->is_string()) ? errorField->get<std::string>() : std::string();
+            return true;
+        }
+        catch (const json::exception &)
+        {
+            return false;
+        }
+    }
+
+    bool parseInteger(const std::string &text, int32_t &value)
+    {
+        if (text.empty())
+            return false;
+
+        char *end = nullptr;
+        errno = 0;
+        const long result = std::strtol(text.c_str(), &end, 10);
+        if (errno != 0 || *end != '\0' || result < INT32_MIN || result > INT32_MAX)
+            return false;
+
+        value = static_cast<int32_t>(result);
+        return true;
+    }
+
+    std::string withoutNonNumbers(const std::string &text)
+    {
+        static const std::regex nonNumber(R"(([:\[,]\s*)[-+]?(nan|inf|infinity)(?=\s*[,}\]]))", std::regex::icase);
+        return std::regex_replace(text, nonNumber, "$1null");
+    }
+
+    // Reply fields are matched ignoring case
+    const json *findField(const json &object, const char *name)
+    {
+        if (!object.is_object())
+            return nullptr;
+
+        for (auto it = object.begin(); it != object.end(); ++it)
+        {
+            if (strcasecmp(it.key().c_str(), name) == 0)
+                return &it.value();
+        }
+        return nullptr;
+    }
+
+    bool numberField(const json &object, const char *name, double &value)
+    {
+        const json *field = findField(object, name);
+        if (field == nullptr || !field->is_number())
+            return false;
+
+        value = field->get<double>();
+        return true;
+    }
+
+    bool textField(const json &object, const char *name, std::string &value)
+    {
+        const json *field = findField(object, name);
+        if (field == nullptr || !field->is_string())
+            return false;
+
+        value = field->get<std::string>();
+        return true;
+    }
+
+    // A value to two decimal places without trailing zeros
+    std::string formatOffset(double value)
+    {
+        char text[32];
+        snprintf(text, sizeof(text), "%.2f", value);
+        std::string result(text);
+        result.erase(result.find_last_not_of('0') + 1);
+        if (result.back() == '.')
+            result.pop_back();
+        return result == "-0" ? "0" : result;
+    }
+
+    // The nearest LED level at or below a raw value the focuser reported
+    int ledIndexFromRaw(int raw)
+    {
+        for (int i = static_cast<int>(std::size(LED_LEVELS)) - 1; i > 0; i--)
+        {
+            if (raw >= LED_LEVELS[i])
+                return i;
+        }
+        return 0;
+    }
+
+
+    int32_t toSteps(double value)
+    {
+        return static_cast<int32_t>(std::lround(std::clamp(value, static_cast<double>(INT32_MIN), static_cast<double>(INT32_MAX))));
+    }
+}
 
 static std::unique_ptr<StarpointFocuser> starpointFocuser(new StarpointFocuser());
 
 StarpointFocuser::StarpointFocuser()
 {
-    setSupportedConnections(CONNECTION_SERIAL);
-    SetCapability(FOCUSER_CAN_ABS_MOVE | FOCUSER_CAN_REL_MOVE | FOCUSER_CAN_SYNC | FOCUSER_CAN_ABORT);
     setVersion(CDRIVER_VERSION_MAJOR, CDRIVER_VERSION_MINOR);
-    setDefaultPollingPeriod(1000);
+    setSupportedConnections(CONNECTION_SERIAL);
+    SetCapability(FOCUSER_CAN_ABS_MOVE | FOCUSER_CAN_REL_MOVE | FOCUSER_CAN_ABORT | FOCUSER_CAN_SYNC);
+    setDefaultPollingPeriod(IDLE_POLL_MS);
 }
 
 const char *StarpointFocuser::getDefaultName()
 {
-    return "Starpoint Focuser";
+    return "Starpoint Australis Focuser";
 }
 
 bool StarpointFocuser::initProperties()
 {
     INDI::Focuser::initProperties();
+
     serialConnection->setDefaultBaudRate(Connection::Serial::B_115200);
 
-    FirmwareTP[SERIAL_NUMBER].fill("SERIAL_NUMBER", "Serial Number", "");
-    FirmwareTP[FIRMWARE_VERSION].fill("FIRMWARE_VERSION", "Firmware Version", "");
-    FirmwareTP.fill(getDeviceName(), "FOCUSER_DETAILS", "Focuser Details", CONNECTION_TAB, IP_RO, 0, IPS_IDLE);
+    FocusMaxPosNP[0].setMinMax(1, INT32_MAX);
+    FocusMinPosNP[0].fill("FOCUS_MIN_VALUE", "Steps", "%.f", 0, INT32_MAX, 1000, 0);
+    FocusMinPosNP.fill(getDeviceName(), "FOCUS_MIN", "Min. Position", MAIN_CONTROL_TAB, IP_RW, 60, IPS_OK);
 
-    TemperatureNP[0].fill("TEMPERATURE", "Temperature (°C)", "%.2f", -100, 100, 0, 0);
-    TemperatureNP.fill(getDeviceName(), "FOCUSER_TEMPERATURE", "Temperature", MAIN_CONTROL_TAB, IP_RO, 0, IPS_IDLE); 
+    FocusSpeedNP[0].setMinMax(MIN_SPEED, MAX_SPEED);
+
+    TemperatureNP[0].fill("TEMPERATURE", "Celsius", "%.2f", -50, 70, 0, 0);
+    TemperatureNP.fill(getDeviceName(), "FOCUS_TEMPERATURE", "Temperature", MAIN_CONTROL_TAB, IP_RO, 0, IPS_IDLE);
+
+    DeviceInfoTP[INFO_MODEL].fill("MODEL", "Model", "");
+    DeviceInfoTP[INFO_FIRMWARE].fill("FIRMWARE", "Firmware", "");
+    DeviceInfoTP[INFO_NAME].fill("NAME", "Name", "");
+    DeviceInfoTP.fill(getDeviceName(), "DEVICE_INFO", "Focuser", INFO_TAB, IP_RO, 0, IPS_IDLE);
+
+    LEDSP[LED_OFF].fill("LED_OFF", "Off", ISS_OFF);
+    LEDSP[LED_LOW].fill("LED_LOW", "Low", ISS_OFF);
+    LEDSP[LED_MEDIUM].fill("LED_MEDIUM", "Medium", ISS_OFF);
+    LEDSP[LED_HIGH].fill("LED_HIGH", "High", ISS_OFF);
+    LEDSP.fill(getDeviceName(), "LED_BRIGHTNESS", "Status Light", OPTIONS_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+
+    TemperatureOffsetNP[0].fill("OFFSET", "Offset (°C)", "%.2f", -MAX_TEMPERATURE_OFFSET, MAX_TEMPERATURE_OFFSET, 0, 0);
+    TemperatureOffsetNP.fill(getDeviceName(), "TEMPERATURE_OFFSET", "Temperature Offset", OPTIONS_TAB, IP_RO, 0, IPS_IDLE);
+
+    TemperatureCalibrationNP[0].fill("ACTUAL", "Actual temperature (°C)", "%.2f", -50, 70, 0.1, 0);
+    TemperatureCalibrationNP.fill(getDeviceName(), "TEMPERATURE_CALIBRATION", "Calibrate Temperature", OPTIONS_TAB, IP_RW, 60,IPS_IDLE);
+
+    TemperatureOffsetClearSP[0].fill("CLEAR", "Clear offset", ISS_OFF);
+    TemperatureOffsetClearSP.fill(getDeviceName(), "TEMPERATURE_OFFSET_CLEAR", "Temperature Offset", OPTIONS_TAB, IP_RW,ISR_ATMOST1, 60, IPS_IDLE);
 
     return true;
 }
@@ -68,27 +290,192 @@ bool StarpointFocuser::updateProperties()
 
     if (isConnected())
     {
-        defineProperty(FirmwareTP);
-        defineProperty(TemperatureNP);
+        defineProperty(FocusMinPosNP);
+        if (m_HasTemperature)
+        {
+            defineProperty(TemperatureNP);
+            m_TemperatureDefined = true;
+        }
+        defineProperty(DeviceInfoTP);
+        if (m_HasLED)
+            defineProperty(LEDSP);
+        if (m_HasTemperatureOffset)
+        {
+            defineProperty(TemperatureOffsetNP);
+            defineProperty(TemperatureCalibrationNP);
+            defineProperty(TemperatureOffsetClearSP);
+        }
     }
     else
     {
-        deleteProperty(FirmwareTP);
-        deleteProperty(TemperatureNP);
+        deleteProperty(FocusMinPosNP);
+        if (m_TemperatureDefined)
+        {
+            deleteProperty(TemperatureNP);
+            m_TemperatureDefined = false;
+        }
+        deleteProperty(DeviceInfoTP);
+        if (m_HasLED)
+            deleteProperty(LEDSP);
+        if (m_HasTemperatureOffset)
+        {
+            deleteProperty(TemperatureOffsetNP);
+            deleteProperty(TemperatureCalibrationNP);
+            deleteProperty(TemperatureOffsetClearSP);
+        }
     }
 
     return true;
 }
 
+bool StarpointFocuser::ISNewNumber(const char *dev, const char *name, double values[], char *names[], int n)
+{
+    if (dev != nullptr && strcmp(dev, getDeviceName()) == 0)
+    {
+        // The focuser stores its limits and speed itself. A copy saved by an older version of
+        // this driver must not overwrite them when the configuration is loaded.
+        if (isConfigLoading() && (FocusMaxPosNP.isNameMatch(name) || FocusMinPosNP.isNameMatch(name) || FocusSpeedNP.isNameMatch(name)))
+            return true;
+
+        // The limits are handled here, not by INDI::Focuser, which would set the minimum to 0
+        if (FocusMaxPosNP.isNameMatch(name))
+        {
+            FocusMaxPosNP.setState(setLimits(m_MinPosition, toSteps(values[0])) ? IPS_OK : IPS_ALERT);
+            FocusMaxPosNP.apply();
+            return true;
+        }
+
+        if (FocusMinPosNP.isNameMatch(name))
+        {
+            FocusMinPosNP.setState(setLimits(toSteps(values[0]), m_MaxPosition) ? IPS_OK : IPS_ALERT);
+            FocusMinPosNP.apply();
+            return true;
+        }
+
+        if (TemperatureCalibrationNP.isNameMatch(name))
+        {
+            TemperatureCalibrationNP.update(values, names, n);
+            TemperatureCalibrationNP.setState(calibrateTemperature(TemperatureCalibrationNP[0].getValue()) ? IPS_OK : IPS_ALERT);
+            TemperatureCalibrationNP.apply();
+            return true;
+        }
+    }
+
+    return INDI::Focuser::ISNewNumber(dev, name, values, names, n);
+}
+
+bool StarpointFocuser::ISNewSwitch(const char *dev, const char *name, ISState *states, char *names[], int n)
+{
+    if (dev != nullptr && strcmp(dev, getDeviceName()) == 0)
+    {
+        // As for the limits - the focuser stores direction itself
+        if (isConfigLoading() && FocusReverseSP.isNameMatch(name))
+            return true;
+
+        if (LEDSP.isNameMatch(name))
+        {
+            const int previous = LEDSP.findOnSwitchIndex();
+            LEDSP.update(states, names, n);
+            if (setLED(LEDSP.findOnSwitchIndex()))
+                LEDSP.setState(IPS_OK);
+            else
+            {
+                LEDSP.reset();
+                if (previous >= 0)
+                    LEDSP[previous].setState(ISS_ON);
+                LEDSP.setState(IPS_ALERT);
+            }
+            LEDSP.apply();
+            return true;
+        }
+
+        if (TemperatureOffsetClearSP.isNameMatch(name))
+        {
+            TemperatureOffsetClearSP.reset();
+            TemperatureOffsetClearSP.setState(setTemperatureOffset(0) ? IPS_OK : IPS_ALERT);
+            TemperatureOffsetClearSP.apply();
+            return true;
+        }
+    }
+
+    return INDI::Focuser::ISNewSwitch(dev, name, states, names, n);
+}
+
 bool StarpointFocuser::Handshake()
 {
-    if (Ack())
+    const std::string port = serialConnection->port();
+
+    std::this_thread::sleep_for(BOOT_DRAIN);
+    discardInput();
+
+    for (int attempt = 1; ; attempt++)
     {
-        LOG_INFO("Connected to Starpoint Focuser");
-        return true;
-    }       
-    
-    return false;
+        std::string reply;
+        const Exchange result = exchange("PING?#", reply);
+        bool ok = false;
+        std::string error;
+        const bool refused = result == Exchange::OK && parseAck(reply, ok, error) && !ok;
+
+        if (result == Exchange::OK && !refused)
+        {
+            if (reply == FOCUSER_REPLY)
+                break;
+
+            LOGF_ERROR("The device on %s is not a Starpoint Australis focuser.", port.c_str());
+            return false;
+        }
+
+        if (result == Exchange::FAILED)
+        {
+            LOGF_ERROR("Could not talk to the device on %s. %s", port.c_str(), m_LastError.c_str());
+            return false;
+        }
+
+        if (attempt == HANDSHAKE_ATTEMPTS)
+        {
+            LOGF_ERROR("No response from %s.", port.c_str());
+            return false;
+        }
+
+        LOGF_DEBUG("No handshake from %s (attempt %d) - retrying", port.c_str(), attempt);
+        std::this_thread::sleep_for(HANDSHAKE_RETRY_DELAY);
+    }
+
+    if (!readConfig())
+        return false;
+
+    if (!readTemperature())
+    {
+        LOGF_ERROR("Could not read the focuser's temperature. %s", m_LastError.c_str());
+        return false;
+    }
+
+    if (!m_HasTemperature)
+        LOG_INFO("The focuser has no temperature reading. Is a temperature probe plugged in?");
+
+    m_FailedPolls = 0;
+    m_LastPollAt = std::chrono::steady_clock::now();
+
+    return true;
+}
+
+bool StarpointFocuser::Disconnect()
+{
+    RemoveTimer(m_TimerID);
+    m_TimerID = -1;
+
+    sendWithoutReply("DISCON#");
+    return INDI::Focuser::Disconnect();
+}
+
+bool StarpointFocuser::saveConfigItems(FILE *fp)
+{
+    // INDI::Focuser would also save the maximum and the direction. The focuser stores these
+    // itself, and loading an old copy would overwrite what is on the device
+    INDI::DefaultDevice::saveConfigItems(fp);
+    PresetNP.save(fp);
+    controller->saveConfigItems(fp);
+    return true;
 }
 
 void StarpointFocuser::TimerHit()
@@ -96,116 +483,101 @@ void StarpointFocuser::TimerHit()
     if (!isConnected())
         return;
 
-    // Update position
-    uint32_t pos;
-    hwReadPosition(pos);
-    FocusAbsPosNP[0].setValue(pos);
-    
-    // Check if the focuser is moving
-    bool isMoving;
-    hwIsMoving(isMoving);
-
-    FocusAbsPosNP.setState(isMoving ? IPS_BUSY : IPS_OK);
-    FocusAbsPosNP.apply();
-    FocusRelPosNP.setState(isMoving ? IPS_BUSY : IPS_OK);
-    FocusRelPosNP.apply();
-
-    // Update temperature
-    double temp;
-    hwReadTemperature(temp);
-    TemperatureNP[0].setValue(temp);
-    TemperatureNP.apply();
-
-    SetTimer(getPollingPeriod());
-}
-
-bool StarpointFocuser::Ack()
-{
-    bool probe = hwProbe();
-    if (!probe)
+    // Poll on every tick while moving, and at the polling period while idle.
+    // A move command makes the focuser count as moving, so the next tick polls it.
+    const auto now = std::chrono::steady_clock::now();
+    if (isMoving() || now - m_LastPollAt >= std::chrono::milliseconds(getPollingPeriod()))
     {
-        LOG_INFO("No response, or device is not a Starpoint Focuser");
-        return false;
+        const bool wasLost = m_FailedPolls >= FAILED_POLLS_BEFORE_LOST;
+        if (poll())
+        {
+            if (wasLost)
+            {
+                LOG_INFO("Contact with the focuser restored.");
+                if (!isMoving())
+                {
+                    FocusAbsPosNP.setState(IPS_OK);
+                    FocusAbsPosNP.apply();
+                    FocusRelPosNP.setState(IPS_OK);
+                    FocusRelPosNP.apply();
+                }
+            }
+            m_FailedPolls = 0;
+        }
+        else
+            pollFailed();
+
+        m_LastPollAt = std::chrono::steady_clock::now();
     }
 
-    std::string resp;
-    if (!sendCommand("STARTSETUP#", resp))
-    {
-        LOG_ERROR("Unable to obtain focuser properties.");
-        return false;
-    }
-
-    trim(resp);
-    auto parts = split_sv(resp);
-    
-    if (parts.size() < 16)
-    {
-        LOG_ERROR("Focuser properties returned an incorrect amount of data.");
-        return false;
-    }
-
-    std::string_view firmware = parts[2];
-    std::string_view temperature = parts[3];
-    std::string_view position = parts[5];
-    std::string_view maxPos = parts[6];
-    std::string_view minPos = parts[7];
-
-    // Parse doubles
-    double tempVal = 0.0, posVal = 0.0, maxPosVal = 0.0, minPosVal = 0.0;
-    if (!to_double(temperature, tempVal)) { LOG_ERROR("Unable to parse temperature value."); return false; }
-    if (!to_double(position, posVal)) { LOG_ERROR("Unable to parse position value."); return false; }
-    if (!to_double(maxPos, maxPosVal)) { LOG_ERROR("Unable to parse maximum position value."); return false; }
-    if (!to_double(minPos, minPosVal)) { LOG_ERROR("Unable to parse minimum position value."); return false; }
-
-    // Push to properties
-    FirmwareTP[FIRMWARE_VERSION].setText(std::string(firmware).c_str());
-    TemperatureNP[0].setValue(tempVal);
-    FocusAbsPosNP[0].setValue(posVal);
-    FocusAbsPosNP[0].setMax(maxPosVal);
-    FocusAbsPosNP[0].setMin(minPosVal);
-
-    // Get device serial number
-    std::string serialNumber;
-    if (hwSerialNumber(serialNumber))
-    {
-        //FirmwareTP[SERIAL_NUMBER].setText(serialNumber);
-    } 
-    
-    return true;
+    m_TimerID = SetTimer(POLL_TICK_MS);
 }
 
 IPState StarpointFocuser::MoveAbsFocuser(uint32_t targetTicks)
 {
-    bool moveA = hwMoveAbsolute(targetTicks);
-    if (!moveA)
+    if (targetTicks < static_cast<uint32_t>(m_MinPosition) || targetTicks > static_cast<uint32_t>(m_MaxPosition))
+    {
+        LOGF_ERROR("The focuser accepts positions from %d to %d.", m_MinPosition, m_MaxPosition);
         return IPS_ALERT;
+    }
 
-    FocusAbsPosNP.setState(IPS_BUSY);
+    if (!sendCommand("MOVE" + std::to_string(targetTicks) + "#"))
+    {
+        LOGF_ERROR("The focuser did not move to %u. %s", targetTicks, m_LastError.c_str());
+        return IPS_ALERT;
+    }
+
+    m_Target = static_cast<int32_t>(targetTicks);
+    m_MoveCommandedAt = std::chrono::steady_clock::now();
+    m_Halted = false;
     return IPS_BUSY;
 }
 
 IPState StarpointFocuser::MoveRelFocuser(FocusDirection dir, uint32_t ticks)
 {
-    bool moveR = hwMoveRelative(dir, ticks);
-    if (!moveR)
+    // Follow the move in 64 bits so an inward move cannot wrap around
+    const int64_t offset = dir == FOCUS_INWARD ? -static_cast<int64_t>(ticks) : static_cast<int64_t>(ticks);
+    const int64_t target = static_cast<int64_t>(m_Position) + offset;
+    if (target < m_MinPosition || target > m_MaxPosition)
+    {
+        LOGF_ERROR("The focuser accepts positions from %d to %d.", m_MinPosition, m_MaxPosition);
         return IPS_ALERT;
+    }
 
-    FocusRelPosNP.setState(IPS_BUSY);
+    if (!sendCommand("MOVEREL" + std::to_string(offset) + "#"))
+    {
+        LOGF_ERROR("The focuser did not move %u steps %s. %s", ticks, dir == FOCUS_INWARD ? "inward" : "outward",m_LastError.c_str());
+        return IPS_ALERT;
+    }
+
+    m_Target = static_cast<int32_t>(target);
+    m_MoveCommandedAt = std::chrono::steady_clock::now();
+    m_Halted = false;
     return IPS_BUSY;
 }
 
 bool StarpointFocuser::SyncFocuser(uint32_t ticks)
 {
-    FocusAbsPosNP.setState(IPS_BUSY);
-
-    std::string cmd = "SYNC" + std::to_string(ticks) + "#";
-    if (!sendCommand(cmd.c_str()))
+    if (isMoving())
     {
-        LOG_ERROR("Unable to sync focuser position");
+        LOG_ERROR("The focuser is moving. Wait for it to stop before syncing.");
         return false;
     }
 
-    FocusAbsPosNP[0].setValue(ticks);
+    if (ticks < static_cast<uint32_t>(m_MinPosition) || ticks > static_cast<uint32_t>(m_MaxPosition))
+    {
+        LOGF_ERROR("The focuser accepts positions from %d to %d.", m_MinPosition, m_MaxPosition);
+        return false;
+    }
+
+    if (!sendCommand("SYNC" + std::to_string(ticks) + "#"))
+    {
+        LOGF_ERROR("Could not sync the focuser to %u. %s", ticks, m_LastError.c_str());
+        return false;
+    }
+
+    m_Position = m_Target = static_cast<int32_t>(ticks);
+    LOGF_INFO("Focuser synced to position %u", ticks);
     return true;
 }
 
@@ -213,274 +585,581 @@ bool StarpointFocuser::AbortFocuser()
 {
     if (!sendCommand("HALT#"))
     {
-        LOG_ERROR("Unable to halt focuser movement,");
+        LOGF_ERROR("Failed to abort the focuser movement. %s", m_LastError.c_str());
+        return false;
+    }
+
+    // Read where the focuser stopped
+    m_Halted = true;
+    if (!poll())
+        pollFailed();
+
+    m_Target = m_Position;
+    m_MoveCommandedAt = {};
+    return true;
+}
+
+bool StarpointFocuser::ReverseFocuser(bool enabled)
+{
+    // 1 is normal and -1 reversed. The focuser refuses 0.
+    if (!sendCommand(enabled ? "DIR-1#" : "DIR1#"))
+    {
+        LOGF_ERROR("Could not change the direction. %s", m_LastError.c_str());
+        return false;
+    }
+
+    LOGF_INFO("Direction set to %s.", enabled ? "reversed" : "normal");
+    return true;
+}
+
+bool StarpointFocuser::SetFocuserSpeed(int speed)
+{
+    if (speed < MIN_SPEED || speed > MAX_SPEED)
+    {
+        LOGF_ERROR("The focuser speed must be between %d and %d.", MIN_SPEED, MAX_SPEED);
+        return false;
+    }
+
+    if (!sendCommand("SPEED" + std::to_string(speed) + "#"))
+    {
+        LOGF_ERROR("Unable to change focuser speed. %s", m_LastError.c_str());
+        return false;
+    }
+
+    LOGF_INFO("Speed set to %d.", speed);
+    return true;
+}
+
+StarpointFocuser:: Exchange StarpointFocuser::exchange(const std::string &command, std::string &reply)
+{
+    reply.clear();
+    discardInput();
+
+    if (!sendWithoutReply(command))
+        return Exchange::FAILED;
+
+    const Exchange result = readReply(reply);
+    if (result == Exchange::OK)
+        LOGF_DEBUG("Received [%s]", printable(reply).c_str());
+    else if (result == Exchange::TIMEOUT)
+    {
+        LOGF_DEBUG("No reply to [%s]", command.c_str());
+        m_LastError = "The focuser did not reply.";
+    }
+    return result;
+}
+
+bool StarpointFocuser::query(const std::string &command, std::string &reply)
+{
+    m_LastRefused = false;
+
+    // Read only, so a timeout is retried
+    auto delay = RETRY_DELAY;
+    for (int attempt = 1; ; attempt++)
+    {
+        const Exchange result = exchange(command, reply);
+        if (result == Exchange::OK)
+            break;
+        if (result == Exchange::FAILED || attempt == QUERY_ATTEMPTS)
+            return false;
+
+        LOGF_DEBUG("Retrying [%s] (attempt %d)", command.c_str(), attempt + 1);
+        std::this_thread::sleep_for(delay);
+        delay *= 2;
+    }
+
+    // A query can also be answered with a failed acknowledgement
+    bool ok = false;
+    std::string error;
+    if (parseAck(reply, ok, error) && !ok)
+    {
+        LOGF_DEBUG("%s -> %s", withoutTerminator(command).c_str(), error.c_str());
+        m_LastError = explainRefusal(error);
+        m_LastRefused = true;
         return false;
     }
 
     return true;
 }
 
-bool StarpointFocuser::SetFocuserMaxPosition(uint32_t ticks)
+bool StarpointFocuser::queryInteger(const std::string &command, int32_t &value)
 {
-    FocusAbsPosNP.setState(IPS_BUSY);
-    bool succeeded = hwSetMaxPosition(ticks);
-    FocusAbsPosNP[0].setMax(ticks);
-    FocusAbsPosNP.setState(IPS_OK);
-    FocusAbsPosNP.apply();
+    std::string reply;
+    if (!query(command, reply))
+        return false;
 
-    return succeeded;
-}
-
-bool StarpointFocuser::hwProbe()
-{
-    LOG_DEBUG("Checking if device is a starpoint focuser");
-
-    std::string resp;
-    if (!sendCommand("PING#", resp))
+    if (!parseInteger(reply, value))
     {
-        LOGF_ERROR("No response from  port %s", serialConnection->getPortFD());
+        LOGF_DEBUG("%s -> %s", withoutTerminator(command).c_str(), printable(reply).c_str());
+        m_LastError = "The focuser gave an unexpected reply.";
         return false;
     }
 
-    trim(resp);
-    if (resp == "FOUND1982")
-        return true;
-
-    return false;  
-}
-
-bool StarpointFocuser::hwSerialNumber(std::string& serialOut)
-{
-    serialOut.clear();
-
-    std::string resp;
-    if (!sendCommand("GSNUM#", resp))
-    {
-        LOG_ERROR("Unable to read device serial number");
-        return false;
-    }
-
-    trim(resp);
-    serialOut = resp;
-
-    LOGF_DEBUG("Reading device serial number: %s", serialOut);
     return true;
 }
 
-bool StarpointFocuser::hwReadPosition(uint32_t &pos)
+bool StarpointFocuser::sendCommand(const std::string &command)
 {
-    std::string resp;
-    if (!sendCommand("GET#", resp))
+    m_LastRefused = false;
+
+    // Every change is acknowledged, and the acknowledgement must be read.
+    std::string reply;
+    if (exchange(command, reply) != Exchange::OK)
+        return false;
+
+    bool ok = false;
+    std::string error;
+    if (!parseAck(reply, ok, error))
     {
-        LOG_ERROR("Unable to get read position");
+        
+        LOGF_DEBUG("%s -> %s", withoutTerminator(command).c_str(), printable(reply).c_str());
+        m_LastError = "The focuser gave an unexpected reply.";
         return false;
     }
 
-    trim(resp);
-    if (!to_u32(resp, pos))
+    if (!ok)
     {
-        LOG_ERROR("Read position returned an invalid value.");
+        LOGF_DEBUG("%s -> %s", withoutTerminator(command).c_str(), error.c_str());
+        m_LastError = explainRefusal(error);
+        m_LastRefused = true;
         return false;
     }
 
-    LOGF_DEBUG("Reading position: %d", pos);
     return true;
 }
 
-bool StarpointFocuser::hwIsMoving(bool &moving)
+bool StarpointFocuser::sendWithoutReply(const std::string &command)
 {
-    std::string resp;
-    if (!sendCommand("MOVING#", resp))
-    {
-        LOG_ERROR("Unable to check if the Focuser is moving.");
-        return false;
-    }
+    LOGF_DEBUG("Sent [%s]", command.c_str());
 
-    trim(resp);
-    moving = resp == "0";
-
-    LOGF_DEBUG("Checking if focuser is moving: %s", moving ? "true" : "false");
-    return true;
-}
-
-bool StarpointFocuser::hwReadTemperature(double &temp)
-{
-    std::string resp;
-    if (!sendCommand("TEMP#", resp))
-    {
-        LOG_ERROR("Unable to get temperature.");
-        return false;
-    }
-
-    trim(resp);
-    to_double(resp.c_str(), temp);
-
-    LOGF_DEBUG("Reading temperature: %d", temp);
-    return true;
-}
-
-bool StarpointFocuser::hwMoveAbsolute(uint32_t targetTicks)
-{
-    // Ensure we are within range
-    targetTicks = std::max(static_cast<uint32_t>(FocusAbsPosNP[0].getMin()), 
-                        std::min(static_cast<uint32_t>(FocusAbsPosNP[0].getMax()), targetTicks));
-
-    std::string cmd = "MOVEA" + std::to_string(targetTicks) + "#";
-    if (!sendCommand(cmd.c_str()))
-    {
-        LOG_ERROR("Unable to move focuser.");
-        return false;
-    }
-
-    LOGF_DEBUG("Moving focuser to position: %d", targetTicks);
-    return true;
-}
-
-bool StarpointFocuser::hwMoveRelative(FocusDirection dir, uint32_t ticks)
-{
-    if (dir == FOCUS_INWARD)
-        ticks = ticks * -1;
-    
-    std::string cmd = std::string("MOVER") + (dir == FOCUS_INWARD ? "1" : "0") + std::to_string(ticks) + "#";
-    if (!sendCommand(cmd.c_str()))
-    {
-        LOG_ERROR("Unable to move focuser.");
-        return false;
-    }
-
-    LOGF_DEBUG("Moving focuser relatively by: %d %s", ticks, dir == FOCUS_INWARD ? "Inwards" : "Outwards");
-    return true;
-}
-
-bool StarpointFocuser::hwSetMaxPosition(uint32_t ticks)
-{
-    std::string cmd = "SMAX" + std::to_string(ticks) + "#";
-    if (!sendCommand(cmd.c_str()))
-    {
-        LOG_ERROR("Unable to set Max position.");
-        return false;
-    }
-
-    LOGF_DEBUG("Max position set to %d", ticks);
-    return true;
-}
-
-bool StarpointFocuser::sendCommand(const char *cmd)
-{
-    return writeRaw(cmd);
-}
-
-bool StarpointFocuser::sendCommand(const char *cmd, std::string &response, bool expectResponse, char terminator, int timeoutSec, size_t maxLen)
-{
-    if (!writeRaw(cmd))
-        return false;
-
-    if (!expectResponse)
-        return true;
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(200)); // Short delay before reading
-    return readUntil(response, terminator, timeoutSec, maxLen);
-}
-
-bool StarpointFocuser::writeRaw(const char *buf)
-{
-    std::lock_guard<std::mutex> lk(ioMutex);
-    const int fd = serialConnection->getPortFD();
-    if (fd < 0)
-        return false;
-
-    int nWrite = 0;
-    const int rc = tty_write_string(fd, buf, &nWrite);
+    int written = 0;
+    const int rc = tty_write_string(PortFD, command.c_str(), &written);
     if (rc != TTY_OK)
     {
-        char errtxt[128] = {};
-        tty_error_msg(rc, errtxt, sizeof(errtxt));
-        LOGF_ERROR("Failed to send command: %s", errtxt);
+        char message[MAXRBUF];
+        tty_error_msg(rc, message, MAXRBUF);
+        LOGF_DEBUG("Writing [%s] failed: %s", command.c_str(), message);
+        m_LastError = "Could not send a command to the focuser.";
         return false;
     }
 
     return true;
 }
 
-bool StarpointFocuser::readUntil(std::string &out, char terminator, int timeoutSec, size_t maxLen)
+void StarpointFocuser::discardInput()
 {
-    std::lock_guard<std::mutex> lk(ioMutex);
-    const int fd = serialConnection->getPortFD();
-    if (fd < 0)
-        return false;
-
-    std::vector<char> buf(maxLen + 1, 0);
-    int nread = 0;
-
-    const int rc = tty_nread_section(fd, buf.data(), static_cast<int>(maxLen), terminator, timeoutSec, &nread);
-    if (rc != TTY_OK)
+    std::string discarded;
+    char buffer[256];
+    for (;;)
     {
-        char errtxt[128] = {};
-        tty_error_msg(rc, errtxt, sizeof(errtxt));
-        LOGF_ERROR("Failed to send command: %s", errtxt);
-        return false;
+        int nread = 0;
+        const int rc = tty_read_expanded(PortFD, buffer, sizeof(buffer), 0, 0, &nread);
+        if (nread > 0)
+            discarded.append(buffer, nread);
+        if (rc != TTY_OK)
+            break;
     }
 
-    buf[std::min<int>(nread, static_cast<int>(maxLen))] = '\0';
-    out.assign(buf.data(), nread);
-    return true;
+    if (!discarded.empty())
+        LOGF_DEBUG("Discarded [%s]", printable(discarded).c_str());
 }
 
-void StarpointFocuser::trim(std::string &s)
+StarpointFocuser::Exchange StarpointFocuser::readReply(std::string &reply)
 {
-    auto issp = [](unsigned char c){ return std::isspace(c) != 0; };
-
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(),
-        [&](unsigned char c){ return !issp(c); }));
-    while (!s.empty() && issp(static_cast<unsigned char>(s.back())))
-        s.pop_back();
-    if (!s.empty() && s.back() == '#')
-        s.pop_back();
-}
-
-/**
-* Zero-alloc splitter for splitting the STARTSETUP response values
-*/
-std::vector<std::string_view>
-StarpointFocuser::split_sv(std::string_view s, char delim)
-{
-    std::vector<std::string_view> out;
-    size_t start = 0;
-    for (size_t i = 0; i < s.size(); ++i)
+    // Replies end in '#' and have no line breaks. Boot and crash logs have line breaks and no
+    // '#', so only the text after the last line break is kept.
+    const auto deadline = std::chrono::steady_clock::now() + REPLY_TIMEOUT;
+    std::string pending;
+    for (;;)
     {
-        if (s[i] == delim) 
+        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0)
+            return Exchange::TIMEOUT;
+
+        char c = 0;
+        int nread = 0;
+        const int rc = tty_read_expanded(PortFD, &c, 1, remaining / 1000000, remaining % 1000000, &nread);
+        if (rc == TTY_TIME_OUT)
+            return Exchange::TIMEOUT;
+        if (rc != TTY_OK)
         {
-            out.emplace_back(s.data() + start, i - start);
-            start = i + 1;
+            char message[MAXRBUF];
+            tty_error_msg(rc, message, MAXRBUF);
+            LOGF_DEBUG("Reading failed: %s", message);
+            m_LastError = "Could not read from the focuser.";
+            return Exchange::FAILED;
         }
+
+        if (c == '#')
+        {
+            reply = trim(pending);
+            pending.clear();
+            if (!reply.empty())
+                return Exchange::OK;
+        }
+        else if (c == '\r' || c == '\n')
+        {
+            if (!pending.empty())
+                LOGF_DEBUG("Discarded [%s]", printable(pending).c_str());
+            pending.clear();
+        }
+        else if (pending.size() < MAX_REPLY_LENGTH)
+            pending += c;
+    }
+}
+
+bool StarpointFocuser::readConfig()
+{
+    std::string reply;
+    if (!query("CONFIG?#", reply))
+    {
+        LOGF_ERROR("Could not read the focuser's settings. %s", m_LastError.c_str());
+        return false;
     }
 
-    out.emplace_back(s.data() + start, s.size() - start);
-    return out;
+    json config;
+    try
+    {
+        config = json::parse(withoutNonNumbers(reply));
+    }
+    catch (const json::exception &e)
+    {
+        LOGF_DEBUG("CONFIG? -> %s (%s)", printable(reply).c_str(), e.what());
+    }
+
+    double position = 0, minimum = 0, maximum = 0;
+    if (!numberField(config, "pos", position) || !numberField(config, "min", minimum) || !numberField(config, "max", maximum))
+    {
+        LOGF_DEBUG("CONFIG -> %s", printable(reply).c_str());
+        LOG_ERROR("Could not read the focuser's settings - its response did not include position and limits");
+        return false;
+    }
+
+    m_Position = m_Target = toSteps(position);
+    m_MinPosition = toSteps(minimum);
+    m_MaxPosition = toSteps(maximum);
+    m_ReportedMoving = false;
+    m_MoveCommandedAt = {};
+    m_Halted = false;
+
+    std::string model = "Focuser", firmware = "unknown", name;
+    textField(config, "model", model);
+    textField(config, "fw", firmware);
+    textField(config, "deviceName", name);
+    DeviceInfoTP[INFO_MODEL].setText(model);
+    DeviceInfoTP[INFO_FIRMWARE].setText(firmware);
+    DeviceInfoTP[INFO_NAME].setText(name);
+    DeviceInfoTP.setState(IPS_OK);
+
+     // Settings stored on the focuser. Older firmware may leave some out; those are hidden.
+    uint32_t capability = FOCUSER_CAN_ABS_MOVE | FOCUSER_CAN_REL_MOVE | FOCUSER_CAN_ABORT | FOCUSER_CAN_SYNC;
+    double value = 0;
+
+    if (numberField(config, "dir", value))
+    {
+        capability |= FOCUSER_CAN_REVERSE;
+        FocusReverseSP.reset();
+        FocusReverseSP[value < 0 ? INDI_ENABLED : INDI_DISABLED].setState(ISS_ON);
+        FocusReverseSP.setState(IPS_OK);
+    }
+
+    if (numberField(config, "speed", value))
+    {
+        capability |= FOCUSER_HAS_VARIABLE_SPEED;
+        FocusSpeedNP[0].setValue(value);
+        FocusSpeedNP.setState(IPS_OK);
+    }
+
+    m_HasLED = numberField(config, "led", value);
+    if (m_HasLED)
+    {
+        LEDSP.reset();
+        LEDSP[ledIndexFromRaw(static_cast<int>(std::lround(value)))].setState(ISS_ON);
+        LEDSP.setState(IPS_OK);
+    }
+
+    m_HasTemperatureOffset = numberField(config, "tempOffsetC", value);
+    if (m_HasTemperatureOffset)
+    {
+        m_TemperatureOffset = std::round(value * 100) / 100;
+        TemperatureOffsetNP[0].setValue(m_TemperatureOffset);
+        TemperatureOffsetNP.setState(IPS_OK);
+    }
+
+    SetCapability(capability);
+
+    FocusAbsPosNP[0].setValue(m_Position);
+    FocusAbsPosNP.setState(IPS_OK);
+    updateLimitProperties();
+
+    if (name.empty())
+        LOGF_INFO("Connected to %s (firmware %s).", model.c_str(), firmware.c_str());
+    else
+        LOGF_INFO("Connected to %s (%s, firmware %s).", name.c_str(), model.c_str(), firmware.c_str());
+    LOGF_DEBUG("Position %d, limits %d to %d.", m_Position, m_MinPosition, m_MaxPosition);
+    return true;
 }
 
-/**
- * Trim a view without copying
- */
-std::string_view StarpointFocuser::trim_sv(std::string_view sv)
+bool StarpointFocuser::readTemperature()
 {
-    auto isws = [](unsigned char c){ return std::isspace(c) != 0; };
-    while (!sv.empty() && isws((unsigned char)sv.front())) sv.remove_prefix(1);
-    while (!sv.empty() && isws((unsigned char)sv.back()))  sv.remove_suffix(1);
-    return sv;
+    std::string reply;
+    bool available = false;
+    double celsius = 0;
+
+    if (query("TEMP?#", reply))
+    {
+        json doc;
+        try{
+            doc = json::parse(withoutNonNumbers(reply));
+        }
+        catch (const json::exception &e)
+        {
+            LOGF_DEBUG("TEMP? => %s (%s)", printable(reply).c_str(), e.what());
+            m_LastError = "The focuser gave an unexpected reply.";
+            return false;
+        }
+
+        const json *availableField = findField(doc, "available");
+        if (availableField == nullptr || !availableField->is_boolean())
+        {
+            LOGF_DEBUG("TEMP? -> %s", printable(reply).c_str());
+            m_LastError = "The focuser gave an unexpected reply.";
+            return false;
+        }
+
+        available = availableField->get<bool>() && numberField(doc, "tempC", celsius);
+    }
+    else if (!m_LastRefused)
+        return false;
+
+    // A refused TEMP? counts as no reading
+    m_TemperatureReadAt = std::chrono::steady_clock::now();
+    const bool wasAvailable = m_HasTemperature;
+    m_HasTemperature = available;
+
+    if (available)
+    {
+        m_Temperature = celsius;
+        TemperatureNP[0].setValue(celsius);
+        TemperatureNP.setState(IPS_OK);
+    }
+    else
+        TemperatureNP.setState(IPS_ALERT);
+
+    // While connecting, updateProperties defines the property afterwards
+    if (!isConnected())
+        return true;
+
+    if (available)
+    {
+        if (!m_TemperatureDefined)
+        {
+            defineProperty(TemperatureNP);
+            m_TemperatureDefined = true;
+        }
+        else
+            TemperatureNP.apply();
+
+        if (!wasAvailable)
+            LOG_INFO("The focuser's temperature reading is available.");
+    }
+    else if (wasAvailable)
+    {
+        TemperatureNP.apply();
+        LOG_WARN("The focuser has no temperature reading. Is the temperature probe plugged in?");
+    }
+
+    return true;
 }
 
-bool StarpointFocuser::to_double(std::string_view sv, double& out)
+bool StarpointFocuser::poll()
 {
-    sv = StarpointFocuser::trim_sv(sv);
-    const char* b = sv.data();
-    const char* e = sv.data() + sv.size();
-    auto res = std::from_chars(b, e, out);
-    return res.ec == std::errc{} && res.ptr == e;
+    // MOVING? first. Once it says stopped, the position read next is final.
+    int32_t moving = 0, position = 0;
+    if (!queryInteger("MOVING?#", moving) || !queryInteger("POS?#", position))
+        return false;
+
+    if (std::chrono::steady_clock::now() - m_TemperatureReadAt >= TEMPERATURE_INTERVAL && !readTemperature())
+        return false;
+
+    const int32_t target = m_Target;
+    m_Position = position;
+    m_ReportedMoving = moving == 1;
+    if (m_ReportedMoving)
+        m_MoveCommandedAt = {};
+    else if (!isMoving())
+        m_Target = position;
+
+    const bool positionChanged = FocusAbsPosNP[0].getValue() != position;
+    FocusAbsPosNP[0].setValue(position);
+
+    if (isMoving())
+    {
+        FocusAbsPosNP.setState(IPS_BUSY);
+        FocusAbsPosNP.apply();
+    }
+    else if (FocusAbsPosNP.getState() == IPS_BUSY || FocusRelPosNP.getState() == IPS_BUSY)
+    {
+        FocusAbsPosNP.setState(IPS_OK);
+        FocusAbsPosNP.apply();
+        if (FocusRelPosNP.getState() == IPS_BUSY)
+        {
+            FocusRelPosNP.setState(IPS_OK);
+            FocusRelPosNP.apply();
+        }
+
+        if (m_Halted)
+            LOGF_INFO("Focuser stopped at %d.", position);
+        else if (position == target)
+            LOGF_INFO("Focuser reached position %d.", position);
+        else
+            LOGF_WARN("The focuser stopped at %d, short of %d.", position, target);
+    }
+    else if (positionChanged)
+        FocusAbsPosNP.apply();
+
+    return true;
 }
 
-bool StarpointFocuser::to_u32(std::string_view sv, uint32_t& out, int base)
+void StarpointFocuser::pollFailed()
 {
-    auto res = std::from_chars(sv.data(), sv.data() + sv.size(), out, base);
-    return res.ec == std::errc{} && res.ptr == sv.data() + sv.size();
+    m_FailedPolls++;
+    LOGF_DEBUG("Poll failed (%d in a row): %s", m_FailedPolls, m_LastError.c_str());
+
+    if (m_FailedPolls == FAILED_POLLS_BEFORE_LOST)
+    {
+        LOGF_ERROR("Lost contact with the focuser. %s Check its USB cable and power. If it does not recover, disconnect and connect again.", m_LastError.c_str());
+        FocusAbsPosNP.setState(IPS_ALERT);
+        FocusAbsPosNP.apply();
+        FocusRelPosNP.setState(IPS_ALERT);
+        FocusRelPosNP.apply();
+    }
+}
+
+bool StarpointFocuser::isMoving() const
+{
+    return m_ReportedMoving || (m_Position != m_Target && std::chrono::steady_clock::now() - m_MoveCommandedAt < MOVE_START_GRACE);
+}
+
+void StarpointFocuser::updateLimitProperties()
+{
+    const double range = static_cast<double>(m_MaxPosition) - m_MinPosition;
+
+    FocusAbsPosNP[0].setMinMax(m_MinPosition, m_MaxPosition);
+    FocusAbsPosNP[0].setStep(std::max(1.0, range / 50));
+    FocusSyncNP[0].setMinMax(m_MinPosition, m_MaxPosition);
+    FocusSyncNP[0].setStep(std::max(1.0, range / 50));
+    FocusRelPosNP[0].setMinMax(0, range);
+    FocusRelPosNP[0].setStep(std::max(1.0, range / 100));
+
+    // Presets keep a minimum of 0, as INDI::Focuser leaves them, so saved presets still load
+    for (auto &preset : PresetNP)
+        preset.setMax(m_MaxPosition);
+
+    FocusMaxPosNP[0].setValue(m_MaxPosition);
+    FocusMinPosNP[0].setValue(m_MinPosition);
+
+    if (isConnected())
+    {
+        FocusAbsPosNP.updateMinMax();
+        FocusSyncNP.updateMinMax();
+        FocusRelPosNP.updateMinMax();
+        PresetNP.updateMinMax();
+    }
+}
+
+bool StarpointFocuser::setLimits(int32_t minimum, int32_t maximum)
+{
+    if (minimum < 0 || maximum <= minimum)
+    {
+        LOGF_ERROR("The maximum position must be above the minimum, and the minimum 0 or above (asked for %d to %d).", minimum, maximum);
+        updateLimitProperties();
+        return false;
+    }
+
+    // Send the changes in the order that never puts minimum above maximum
+    const bool maximumFirst = minimum > m_MaxPosition;
+    for (int i = 0; i < 2; i++)
+    {
+        const bool isMaximum = (i == 0) == maximumFirst;
+        const int32_t value = isMaximum ? maximum : minimum;
+        int32_t &current = isMaximum ? m_MaxPosition : m_MinPosition;
+        if (value == current)
+            continue;
+
+        if (!sendCommand(std::string(isMaximum ? "MAX" : "MIN") + std::to_string(value) + "#"))
+        {
+            LOGF_ERROR("Could not change the %s position. %s", isMaximum ? "maximum" : "minimum", m_LastError.c_str());
+            updateLimitProperties();
+            return false;
+        }
+
+        current = value;
+    }
+
+    updateLimitProperties();
+    LOGF_INFO("Focuser limits set to %d to %d.", m_MinPosition, m_MaxPosition);
+    return true;
+}
+
+bool StarpointFocuser::setLED(int index)
+{
+    if (index < 0)
+        return false;
+
+    if (!sendCommand("LED" + std::to_string(LED_LEVELS[index]) + "#"))
+    {
+        LOGF_ERROR("Could not change the status light brightness level. %s", m_LastError.c_str());
+        return false;
+    }
+
+    LOGF_INFO("Status light brightness level set to %s.", LEDSP[index].getLabel());
+    return true;
+}
+
+bool StarpointFocuser::calibrateTemperature(double actual)
+{
+    if (!readTemperature())
+    {
+        LOGF_ERROR("Could not read the focuser's temperature. %s", m_LastError.c_str());
+        return false;
+    }
+
+    if (!m_HasTemperature)
+    {
+        LOG_ERROR("The focuser has no temperature to calibrate against.");
+        return false;
+    }
+
+    // The reading includes the current offset, so the probe's own reading is the difference 
+    const double probe = m_Temperature - m_TemperatureOffset;
+    const double offset = std::round((actual - probe) * 100) / 100;
+    if (std::fabs(offset) > MAX_TEMPERATURE_OFFSET)
+    {
+        LOGF_ERROR("%.2f °C is more than %.0f °C from the probe's reading of %.2f °C. A temperature offset this high cannot be set.", actual, MAX_TEMPERATURE_OFFSET, probe);
+        return false;
+    }
+
+    return setTemperatureOffset(offset);
+}
+
+bool StarpointFocuser::setTemperatureOffset(double offset)
+{
+    if (!sendCommand("TEMPOFFSET" + formatOffset(offset) + "#"))
+    {
+        LOGF_ERROR("Could not set the temperature offset. %s", m_LastError.c_str());
+        TemperatureOffsetNP.setState(IPS_ALERT);
+        TemperatureOffsetNP.apply();
+        return false;
+    }
+
+    m_TemperatureOffset = offset;
+    TemperatureOffsetNP[0].setValue(offset);
+    TemperatureOffsetNP.setState(IPS_OK);
+    TemperatureOffsetNP.apply();
+
+    // Show the new reading at the next poll
+    m_TemperatureReadAt = {};
+    LOGF_INFO("Temperature offset set to %s °C.", formatOffset(offset).c_str());
+    return true;
 }
