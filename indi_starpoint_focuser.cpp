@@ -113,7 +113,7 @@ namespace
         if (error == "unsupported")
             return "The focuser's firmware does not support this command.";
         if (error == "security_required")
-            return "The focuser requires Bluetooth pairing before this can be used.";
+            return "The focuser refused this for security reasons.";
         if (error == "busy")
             return "The focuser is busy and refused the command. Try again in a moment.";
         return "The focuser refused the command.";
@@ -223,7 +223,6 @@ namespace
         }
         return 0;
     }
-
 
     int32_t toSteps(double value)
     {
