@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(indi_starpoint_focuser C CXX)
+project(indi-starpoint C CXX)
 
 include(GNUInstallDirs)
 
@@ -17,7 +17,7 @@ if(NOT INDI_JSONLIB)
     add_definitions(-D_USE_SYSTEM_JSONLIB)
 endif()
 
-# Set the version number in config.h and the driver's XML file
+# Set the version number in config.h and the drivers' XML file
 set(CDRIVER_VERSION_MAJOR 2)
 set(CDRIVER_VERSION_MINOR 0)
 
@@ -27,8 +27,8 @@ configure_file(
 )
 
 configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/indi_starpoint_focuser.xml.cmake
-    ${CMAKE_CURRENT_BINARY_DIR}/indi_starpoint_focuser.xml
+    ${CMAKE_CURRENT_SOURCE_DIR}/indi_starpoint.xml.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/indi_starpoint.xml
 )
 
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
@@ -37,23 +37,36 @@ include_directories(${INDI_INCLUDE_DIR})
 
 include(CMakeCommon)
 
+# Code shared by all the Starpoint Australis drivers
+add_library(
+    starpoint_common STATIC
+    starpoint_bluetooth.cpp
+    starpoint_protocol.cpp
+)
+
+target_link_libraries(
+    starpoint_common
+    ${INDI_LIBRARIES}
+    PkgConfig::SYSTEMD
+)
+
+# Focuser
 add_executable(
     indi_starpoint_focuser
-    indi_starpoint_focuser.cpp
-    starpoint_bluetooth.cpp
+    starpoint_focuser.cpp
 )
 
 target_link_libraries(
     indi_starpoint_focuser
+    starpoint_common
     ${INDI_LIBRARIES}
-    PkgConfig::SYSTEMD
 )
 
 install(TARGETS indi_starpoint_focuser RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 install(
     FILES
-        ${CMAKE_CURRENT_BINARY_DIR}/indi_starpoint_focuser.xml
+        ${CMAKE_CURRENT_BINARY_DIR}/indi_starpoint.xml
     DESTINATION
         ${INDI_DATA_DIR}
 )

@@ -1,10 +1,16 @@
-# Starpoint Australis Focuser INDI Driver
-This repository contains the **INDI driver** for the Starpoint Australis Focuser.
-It allows KStars/Ekos and any INDI-compatible automation system to control the focuser over USB.
+# Starpoint Australis INDI Drivers
+This repository contains the **INDI drivers** for Starpoint Australis equipment.
+They allow KStars/Ekos and any INDI-compatible automation system to control it over USB.
 
+- [Starpoint Australis Focuser](#starpoint-australis-focuser) (`indi_starpoint_focuser`)
+
+Firmware updates are made with the Starpoint Hub app, which can be downloaded from
+[our website](https://www.starpointaustralis.com.au).
+See [doc/index.md](doc/index.md) for connecting and using the drivers.
+
+## Starpoint Australis Focuser
 <img width="4000" height="3000" alt="Starpoint Australis Focuser" src="https://github.com/user-attachments/assets/0b0680c9-8c98-4680-8334-1c64d935eb63" />
 
-## Features
 - Absolute and relative moves, abort and sync
 - Minimum and maximum positions, stored on the focuser
 - Reverse direction and motor speed
@@ -13,27 +19,23 @@ It allows KStars/Ekos and any INDI-compatible automation system to control the f
 - The focuser's model, firmware version and name
 - Simulation mode, for trying the driver without a focuser
 
-Firmware updates are made with the Starpoint Hub app, which can be downloaded from
-[our website](https://www.starpointaustralis.com.au).
-See [doc/index.md](doc/index.md) for connecting and using the driver.
-
 ## Dependencies
 The following packages must be installed before building:
 ```bash
-sudo apt install -y cmake g++ libindi-dev
+sudo apt install -y cmake g++ pkg-config libindi-dev libsystemd-dev
 ```
-The driver needs INDI 2.0 or later and CMake 3.16 or later. Check the version your system offers with
+The drivers need INDI 2.0 or later and CMake 3.16 or later. `libsystemd-dev` is for their Bluetooth connection. Check the version your system offers with
 `apt policy libindi-dev`. If it is older than 2.0, install INDI from the INDI project instead; on Ubuntu,
 add its PPA first with `sudo add-apt-repository ppa:mutlaqja/ppa`.
 
-## Building and Installing the Driver
+## Building and Installing the Drivers
 The following steps are for Debian-based Linux, such as Ubuntu and Raspberry Pi OS.
 1. Clone the repository
 ```bash
 mkdir -p ~/Projects
 cd ~/Projects
-git clone https://github.com/starpointaustralis/indi_starpoint_focuser.git
-cd indi_starpoint_focuser
+git clone https://github.com/starpointaustralis/indi-starpoint.git
+cd indi-starpoint
 ```
 2. Create and enter the build directory
 ```bash
@@ -41,21 +43,21 @@ mkdir build
 cd build
 ```
 3. Configure the build
-Install to `/usr` so the driver appears in KStars automatically:
+Install to `/usr` so the drivers appear in KStars automatically:
 ```bash
 cmake .. -DCMAKE_INSTALL_PREFIX=/usr
 ```
-4. Build the driver
+4. Build the drivers
 ```bash
 make -j4
 ```
-5. Install the driver
+5. Install the drivers
 ```bash
 sudo make install
 ```
 This installs:
-- The driver executable `/usr/bin/indi_starpoint_focuser`
-- The XML definition `/usr/share/indi/indi_starpoint_focuser.xml`
+- The focuser driver `/usr/bin/indi_starpoint_focuser`
+- The XML definition `/usr/share/indi/indi_starpoint.xml`
 
 ## Trying It Without a Focuser
 In KStars, start an Ekos profile that uses **Starpoint Australis Focuser**. In the INDI Control Panel,
@@ -73,10 +75,10 @@ indi_setprop "Starpoint Australis Focuser.CONNECTION.CONNECT=On"
 indi_getprop "Starpoint Australis Focuser.*.*"
 ```
 
-## Removing the Driver
+## Removing the Drivers
 ```bash
 sudo rm -f /usr/bin/indi_starpoint_focuser
-sudo rm -f /usr/share/indi/indi_starpoint_focuser.xml
+sudo rm -f /usr/share/indi/indi_starpoint.xml
 ```
 
 ## Licence

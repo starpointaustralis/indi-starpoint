@@ -23,15 +23,15 @@
 
 #include "indifocuser.h"
 #include "starpoint_bluetooth.h"
+#include "starpoint_protocol.h"
 
 #include <chrono>
 #include <cstdint>
 #include <string>
 
 /**
-* Starpoint Australis focusers over USB serial. Commands and replies are ASCII text
-* ending in '#'; commands that change something are answered with a JSON acknowledgement,
-* {"ok":true} or {"ok":false,"error":"..."}
+* Starpoint Australis focusers, over USB serial or Bluetooth LE. StarpointProtocol talks to
+* them; this class follows the focuser's state.
 */
 class StarpointFocuser : public INDI::Focuser
 {
@@ -61,23 +61,6 @@ class StarpointFocuser : public INDI::Focuser
         virtual bool SetFocuserSpeed(int speed) override;
 
     private:
-        enum class Exchange
-        {
-            OK,
-            TIMEOUT,
-            FAILED
-        };
-
-        // Talking to the focuser. One command is in flight at a time, and each command is
-        // sent and its reply read in a single call. Each sets m_LastError if it fails.
-        Exchange exchange(const std::string &command, std::string &reply);
-        bool query(const std::string &command, std::string &reply);
-        bool queryInteger(const std::string &command, int32_t &value);
-        bool sendCommand(const std::string &command);
-        bool sendWithoutReply(const std::string &command);
-        void discardInput();
-        Exchange readReply(std::string &reply);
-        Exchange readByte(char &c, std::chrono::steady_clock::time_point deadline);
         bool usingBluetooth();
 
         // Focuser state
@@ -93,8 +76,7 @@ class StarpointFocuser : public INDI::Focuser
         bool setTemperatureOffset(double offset);
 
         StarpointBluetoothConnection *m_BluetoothConnection {nullptr};
-        std::string m_LastError;
-        bool m_LastRefused {false};
+        StarpointProtocol m_Protocol;
 
         int32_t m_Position {0};
         bool m_ReportedMoving {false};

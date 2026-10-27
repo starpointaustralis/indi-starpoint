@@ -19,45 +19,25 @@
 
 */
 
-#include "indi_starpoint_focuser.h"
+#include "starpoint_focuser.h"
 
 #include "config.h"
 #include "indicom.h"
 #include "indicontroller.h"
 #include "connectionplugins/connectionserial.h"
 
-#ifdef _USE_SYSTEM_JSONLIB
-#include <nlohmann/json.hpp>
-#else
-#include <indijson.hpp>
-#endif
-
 #include <algorithm>
-#include <cerrno>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <memory>
-#include <regex>
-#include <thread>
-
-#include <strings.h>
 
 using json = nlohmann::json;
 
 namespace
 {
-    // Serial protocol timing
-    constexpr auto BOOT_DRAIN = std::chrono::milliseconds(200);
-    constexpr auto REPLY_TIMEOUT = std::chrono::seconds(2);
-    constexpr int QUERY_ATTEMPTS = 3;
-    constexpr auto RETRY_DELAY = std::chrono::milliseconds(200);
-    constexpr int HANDSHAKE_ATTEMPTS = 5;
-    constexpr auto HANDSHAKE_RETRY_DELAY = std::chrono::seconds(1);
-    constexpr size_t MAX_REPLY_LENGTH = 4096;
-
     // Polling
     constexpr uint32_t POLL_TICK_MS = 250;
     constexpr uint32_t IDLE_POLL_MS = 2000;
@@ -82,133 +62,6 @@ namespace
     constexpr int MIN_SPEED = 1;
     constexpr int MAX_SPEED = 255;
     constexpr double MAX_TEMPERATURE_OFFSET = 20;
-
-    std::string withoutTerminator(const std::string &command)
-    {
-        return (!command.empty() && command.back() == '#') ? command.substr(0, command.size() - 1) : command;
-    }
-
-    std::string trim(const std::string &text)
-    {
-        const auto first = text.find_first_not_of(" \t");
-        if (first == std::string::npos)
-            return std::string();
-        return text.substr(first, text.find_last_not_of(" \t") - first + 1);
-    }
-
-    // Raw device text for debug logs, with line breaks and other control characters made visible
-    std::string printable(const std::string &text)
-    {
-        std::string result;
-        for (unsigned char c : text)
-        {
-            if (c == '\r')
-                result += "\\r";
-            else if (c == '\n')
-                result += "\\n";
-            else if (c < 0x20 || c == 0x7F)
-                result += '?';
-            else
-                result += static_cast<char>(c);
-        }
-        return result;
-    }
-
-    // What a refused command means in plain English
-    std::string explainRefusal(const std::string &error)
-    {
-        if (error == "range")
-            return "The focuser rejected the value as out of range.";
-        if (error == "unsupported")
-            return "The focuser's firmware does not support this command.";
-        if (error == "security_required")
-            return "The focuser needs a paired Bluetooth connection for this. Disconnect, then connect again to pair.";
-        if (error == "busy")
-            return "The focuser is busy and refused the command. Try again in a moment.";
-        return "The focuser refused the command.";
-    }
-
-    // Reads an acknowledgement. Returns false if the reply is not one.
-    bool parseAck(const std::string &reply, bool &ok, std::string &error)
-    {
-        if (reply.empty() || reply.front() != '{')
-            return false;
-
-        try
-        {
-            const json doc = json::parse(reply);
-            if (!doc.is_object())
-                return false;
-
-            const auto okField = doc.find("ok");
-            if (okField == doc.end() || !okField->is_boolean())
-                return false;
-
-            ok = okField->get<bool>();
-            const auto errorField = doc.find("error");
-            error = (errorField != doc.end() && errorField->is_string()) ? errorField->get<std::string>() : std::string();
-            return true;
-        }
-        catch (const json::exception &)
-        {
-            return false;
-        }
-    }
-
-    bool parseInteger(const std::string &text, int32_t &value)
-    {
-        if (text.empty())
-            return false;
-
-        char *end = nullptr;
-        errno = 0;
-        const long result = std::strtol(text.c_str(), &end, 10);
-        if (errno != 0 || *end != '\0' || result < INT32_MIN || result > INT32_MAX)
-            return false;
-
-        value = static_cast<int32_t>(result);
-        return true;
-    }
-
-    std::string withoutNonNumbers(const std::string &text)
-    {
-        static const std::regex nonNumber(R"(([:\[,]\s*)[-+]?(nan|inf|infinity)(?=\s*[,}\]]))", std::regex::icase);
-        return std::regex_replace(text, nonNumber, "$1null");
-    }
-
-    // Reply fields are matched ignoring case
-    const json *findField(const json &object, const char *name)
-    {
-        if (!object.is_object())
-            return nullptr;
-
-        for (auto it = object.begin(); it != object.end(); ++it)
-        {
-            if (strcasecmp(it.key().c_str(), name) == 0)
-                return &it.value();
-        }
-        return nullptr;
-    }
-
-    bool numberField(const json &object, const char *name, double &value)
-    {
-        const json *field = findField(object, name);
-        if (field == nullptr || !field->is_number())
-            return false;
-
-        value = field->get<double>();
-        return true;
-    }
-
-    bool textField(const json &object, const char *name, std::string &value)
-    {
-        const json *field = findField(object, name);
-        if (field == nullptr || !field->is_string())
-            return false;
-
-        value = field->get<std::string>();
-        return true;
-    }
 
     // A value to two decimal places without trailing zeros
     std::string formatOffset(double value)
@@ -239,10 +92,38 @@ namespace
     }
 }
 
+using Starpoint::findField;
+using Starpoint::numberField;
+using Starpoint::printable;
+using Starpoint::textField;
+using Starpoint::withoutNonNumbers;
+using Starpoint::withoutTerminator;
+
 static std::unique_ptr<StarpointFocuser> starpointFocuser(new StarpointFocuser());
 
-StarpointFocuser::StarpointFocuser()
+StarpointFocuser::StarpointFocuser() : m_Protocol(this, "focuser")
 {
+    // Commands go to the simulator, the Bluetooth link or the serial port, whichever is in use
+    m_Protocol.setRoute(
+    {
+        [this]()
+        {
+            return isSimulation();
+        },
+        [this](const std::string & command)
+        {
+            return m_Simulator.reply(command);
+        },
+        [this]() -> StarpointBluetoothLink *
+        {
+            return usingBluetooth() ? &m_BluetoothConnection->link() : nullptr;
+        },
+        [this]()
+        {
+            return PortFD;
+        }
+    });
+
     setVersion(CDRIVER_VERSION_MAJOR, CDRIVER_VERSION_MINOR);
     setSupportedConnections(CONNECTION_SERIAL);
     SetCapability(FOCUSER_CAN_ABS_MOVE | FOCUSER_CAN_REL_MOVE | FOCUSER_CAN_ABORT | FOCUSER_CAN_SYNC);
@@ -429,52 +310,15 @@ bool StarpointFocuser::Handshake()
     if (!isSimulation())
         port = usingBluetooth() ? "Bluetooth " + m_BluetoothConnection->address() : std::string(serialConnection->port());
 
-    // Over USB, the focuser may have just restarted
-    if (!isSimulation() && !usingBluetooth())
-    {
-        std::this_thread::sleep_for(BOOT_DRAIN);
-        discardInput();
-    }
-    
-    for (int attempt = 1; ; attempt++)
-    {
-        std::string reply;
-        const Exchange result = exchange("PING?#", reply);
-        bool ok = false;
-        std::string error;
-        const bool refused = result == Exchange::OK && parseAck(reply, ok, error) && !ok;
-
-        if (result == Exchange::OK && !refused)
-        {
-            if (reply == FOCUSER_REPLY)
-                break;
-
-            LOGF_ERROR("The device on %s is not a Starpoint Australis focuser.", port.c_str());
-            return false;
-        }
-
-        if (result == Exchange::FAILED)
-        {
-            LOGF_ERROR("Could not talk to the device on %s. %s", port.c_str(), m_LastError.c_str());
-            return false;
-        }
-
-        if (attempt == HANDSHAKE_ATTEMPTS)
-        {
-            LOGF_ERROR("No response from %s.", port.c_str());
-            return false;
-        }
-
-        LOGF_DEBUG("No handshake from %s (attempt %d) - retrying", port.c_str(), attempt);
-        std::this_thread::sleep_for(HANDSHAKE_RETRY_DELAY);
-    }
+    if (!m_Protocol.identify(port, FOCUSER_REPLY))
+        return false;
 
     if (!readConfig())
         return false;
 
     if (!readTemperature())
     {
-        LOGF_ERROR("Could not read the focuser's temperature. %s", m_LastError.c_str());
+        LOGF_ERROR("Could not read the focuser's temperature. %s", m_Protocol.lastError().c_str());
         return false;
     }
 
@@ -492,7 +336,7 @@ bool StarpointFocuser::Disconnect()
     RemoveTimer(m_TimerID);
     m_TimerID = -1;
 
-    sendWithoutReply("DISCON#");
+    m_Protocol.sendWithoutReply("DISCON#");
     return INDI::Focuser::Disconnect();
 }
 
@@ -549,9 +393,9 @@ IPState StarpointFocuser::MoveAbsFocuser(uint32_t targetTicks)
         return IPS_ALERT;
     }
 
-    if (!sendCommand("MOVE" + std::to_string(targetTicks) + "#"))
+    if (!m_Protocol.sendCommand("MOVE" + std::to_string(targetTicks) + "#"))
     {
-        LOGF_ERROR("The focuser did not move to %u. %s", targetTicks, m_LastError.c_str());
+        LOGF_ERROR("The focuser did not move to %u. %s", targetTicks, m_Protocol.lastError().c_str());
         return IPS_ALERT;
     }
 
@@ -572,9 +416,9 @@ IPState StarpointFocuser::MoveRelFocuser(FocusDirection dir, uint32_t ticks)
         return IPS_ALERT;
     }
 
-    if (!sendCommand("MOVEREL" + std::to_string(offset) + "#"))
+    if (!m_Protocol.sendCommand("MOVEREL" + std::to_string(offset) + "#"))
     {
-        LOGF_ERROR("The focuser did not move %u steps %s. %s", ticks, dir == FOCUS_INWARD ? "inward" : "outward",m_LastError.c_str());
+        LOGF_ERROR("The focuser did not move %u steps %s. %s", ticks, dir == FOCUS_INWARD ? "inward" : "outward",m_Protocol.lastError().c_str());
         return IPS_ALERT;
     }
 
@@ -598,9 +442,9 @@ bool StarpointFocuser::SyncFocuser(uint32_t ticks)
         return false;
     }
 
-    if (!sendCommand("SYNC" + std::to_string(ticks) + "#"))
+    if (!m_Protocol.sendCommand("SYNC" + std::to_string(ticks) + "#"))
     {
-        LOGF_ERROR("Could not sync the focuser to %u. %s", ticks, m_LastError.c_str());
+        LOGF_ERROR("Could not sync the focuser to %u. %s", ticks, m_Protocol.lastError().c_str());
         return false;
     }
 
@@ -611,9 +455,9 @@ bool StarpointFocuser::SyncFocuser(uint32_t ticks)
 
 bool StarpointFocuser::AbortFocuser()
 {
-    if (!sendCommand("HALT#"))
+    if (!m_Protocol.sendCommand("HALT#"))
     {
-        LOGF_ERROR("Failed to abort the focuser movement. %s", m_LastError.c_str());
+        LOGF_ERROR("Failed to abort the focuser movement. %s", m_Protocol.lastError().c_str());
         return false;
     }
 
@@ -630,9 +474,9 @@ bool StarpointFocuser::AbortFocuser()
 bool StarpointFocuser::ReverseFocuser(bool enabled)
 {
     // 1 is normal and -1 reversed. The focuser refuses 0.
-    if (!sendCommand(enabled ? "DIR-1#" : "DIR1#"))
+    if (!m_Protocol.sendCommand(enabled ? "DIR-1#" : "DIR1#"))
     {
-        LOGF_ERROR("Could not change the direction. %s", m_LastError.c_str());
+        LOGF_ERROR("Could not change the direction. %s", m_Protocol.lastError().c_str());
         return false;
     }
 
@@ -648,9 +492,9 @@ bool StarpointFocuser::SetFocuserSpeed(int speed)
         return false;
     }
 
-    if (!sendCommand("SPEED" + std::to_string(speed) + "#"))
+    if (!m_Protocol.sendCommand("SPEED" + std::to_string(speed) + "#"))
     {
-        LOGF_ERROR("Unable to change focuser speed. %s", m_LastError.c_str());
+        LOGF_ERROR("Unable to change focuser speed. %s", m_Protocol.lastError().c_str());
         return false;
     }
 
@@ -658,237 +502,17 @@ bool StarpointFocuser::SetFocuserSpeed(int speed)
     return true;
 }
 
-StarpointFocuser:: Exchange StarpointFocuser::exchange(const std::string &command, std::string &reply)
-{
-    reply.clear();
-    if (isSimulation())
-    {
-        LOGF_DEBUG("Sent [%s]", command.c_str());
-        reply = m_Simulator.reply(command);
-        LOGF_DEBUG("received [%s]", reply.c_str());
-        return Exchange::OK;
-    }
-    discardInput();
-
-    if (!sendWithoutReply(command))
-        return Exchange::FAILED;
-
-    const Exchange result = readReply(reply);
-    if (result == Exchange::OK)
-        LOGF_DEBUG("Received [%s]", printable(reply).c_str());
-    else if (result == Exchange::TIMEOUT)
-    {
-        LOGF_DEBUG("No reply to [%s]", command.c_str());
-        m_LastError = "The focuser did not reply.";
-    }
-    return result;
-}
-
-bool StarpointFocuser::query(const std::string &command, std::string &reply)
-{
-    m_LastRefused = false;
-
-    // Read only, so a timeout is retried
-    auto delay = RETRY_DELAY;
-    for (int attempt = 1; ; attempt++)
-    {
-        const Exchange result = exchange(command, reply);
-        if (result == Exchange::OK)
-            break;
-        if (result == Exchange::FAILED || attempt == QUERY_ATTEMPTS)
-            return false;
-
-        LOGF_DEBUG("Retrying [%s] (attempt %d)", command.c_str(), attempt + 1);
-        std::this_thread::sleep_for(delay);
-        delay *= 2;
-    }
-
-    // A query can also be answered with a failed acknowledgement
-    bool ok = false;
-    std::string error;
-    if (parseAck(reply, ok, error) && !ok)
-    {
-        LOGF_DEBUG("%s -> %s", withoutTerminator(command).c_str(), error.c_str());
-        m_LastError = explainRefusal(error);
-        m_LastRefused = true;
-        return false;
-    }
-
-    return true;
-}
-
-bool StarpointFocuser::queryInteger(const std::string &command, int32_t &value)
-{
-    std::string reply;
-    if (!query(command, reply))
-        return false;
-
-    if (!parseInteger(reply, value))
-    {
-        LOGF_DEBUG("%s -> %s", withoutTerminator(command).c_str(), printable(reply).c_str());
-        m_LastError = "The focuser gave an unexpected reply.";
-        return false;
-    }
-
-    return true;
-}
-
-bool StarpointFocuser::sendCommand(const std::string &command)
-{
-    m_LastRefused = false;
-
-    // Every change is acknowledged, and the acknowledgement must be read.
-    std::string reply;
-    if (exchange(command, reply) != Exchange::OK)
-        return false;
-
-    bool ok = false;
-    std::string error;
-    if (!parseAck(reply, ok, error))
-    {
-        
-        LOGF_DEBUG("%s -> %s", withoutTerminator(command).c_str(), printable(reply).c_str());
-        m_LastError = "The focuser gave an unexpected reply.";
-        return false;
-    }
-
-    if (!ok)
-    {
-        LOGF_DEBUG("%s -> %s", withoutTerminator(command).c_str(), error.c_str());
-        m_LastError = explainRefusal(error);
-        m_LastRefused = true;
-        return false;
-    }
-
-    return true;
-}
-
-bool StarpointFocuser::sendWithoutReply(const std::string &command)
-{
-    LOGF_DEBUG("Sent [%s]", command.c_str());
-    if (isSimulation())
-        return true;
-
-    if (usingBluetooth())
-    {
-        if (m_BluetoothConnection->link().write(command))
-            return true;
-        m_LastError = m_BluetoothConnection->link().lastError();
-        return false;
-    }
-
-    int written = 0;
-    const int rc = tty_write_string(PortFD, command.c_str(), &written);
-    if (rc != TTY_OK)
-    {
-        char message[MAXRBUF];
-        tty_error_msg(rc, message, MAXRBUF);
-        LOGF_DEBUG("Writing [%s] failed: %s", command.c_str(), message);
-        m_LastError = "Could not send a command to the focuser.";
-        return false;
-    }
-
-    return true;
-}
-
-void StarpointFocuser::discardInput()
-{
-    std::string discarded;
-    char buffer[256];
-    if (usingBluetooth())
-        discarded = m_BluetoothConnection->link().takeReceived();
-    else for (;;)
-    {
-        int nread = 0;
-        const int rc = tty_read_expanded(PortFD, buffer, sizeof(buffer), 0, 0, &nread);
-        if (nread > 0)
-            discarded.append(buffer, nread);
-        if (rc != TTY_OK)
-            break;
-    }
-
-    if (!discarded.empty())
-        LOGF_DEBUG("Discarded [%s]", printable(discarded).c_str());
-}
-
-StarpointFocuser::Exchange StarpointFocuser::readByte(char &c, std::chrono::steady_clock::time_point deadline)
-{
-    if (usingBluetooth())
-    {
-        switch (m_BluetoothConnection->link().read(c, deadline))
-        {
-            case StarpointBluetoothLink::Read::OK:
-                return Exchange::OK;
-            case StarpointBluetoothLink::Read::TIMEOUT:
-                return Exchange::TIMEOUT;
-            case StarpointBluetoothLink::Read::LOST:
-                break;
-        }
-        m_LastError = "Lost contact with the focuser over Bluetooth.";
-        return Exchange::FAILED;
-    }
-
-    const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
-    if (remaining <= 0)
-        return Exchange::TIMEOUT;
-
-    int nread = 0;
-    const int rc = tty_read_expanded(PortFD, &c, 1, remaining / 1000000, remaining % 1000000, &nread);
-    if (rc == TTY_TIME_OUT)
-        return Exchange::TIMEOUT;
-    if (rc != TTY_OK)
-    {
-        char message[MAXRBUF];
-        tty_error_msg(rc, message, MAXRBUF);
-        LOGF_DEBUG("Reading failed: %s", message);
-        m_LastError = "Could not read from the focuser.";
-        return Exchange::FAILED;
-    }
-    return Exchange::OK;
-}
-
 bool StarpointFocuser::usingBluetooth()
 {
     return m_BluetoothConnection != nullptr && getActiveConnection() == m_BluetoothConnection;
 }
 
-StarpointFocuser::Exchange StarpointFocuser::readReply(std::string &reply)
-{
-    // Replies end in '#' and have no line breaks. Boot and crash logs have line breaks and no
-    // '#', so only the text after the last line break is kept.
-    const auto deadline = std::chrono::steady_clock::now() + REPLY_TIMEOUT;
-    std::string pending;
-    for (;;)
-    {
-        char c = 0;
-        const Exchange result = readByte(c, deadline);
-        if (result != Exchange::OK)
-            return result;
-
-        if (c == '#')
-        {
-            reply = trim(pending);
-            pending.clear();
-            if (!reply.empty())
-                return Exchange::OK;
-        }
-        else if (c == '\r' || c == '\n')
-        {
-            if (!pending.empty())
-                LOGF_DEBUG("Discarded [%s]", printable(pending).c_str());
-            pending.clear();
-        }
-        else if (pending.size() < MAX_REPLY_LENGTH)
-            pending += c;
-    }
-}
-
 bool StarpointFocuser::readConfig()
 {
     std::string reply;
-    if (!query("CONFIG?#", reply))
+    if (!m_Protocol.query("CONFIG?#", reply))
     {
-        LOGF_ERROR("Could not read the focuser's settings. %s", m_LastError.c_str());
+        LOGF_ERROR("Could not read the focuser's settings. %s", m_Protocol.lastError().c_str());
         return false;
     }
 
@@ -981,7 +605,7 @@ bool StarpointFocuser::readTemperature()
     bool available = false;
     double celsius = 0;
 
-    if (query("TEMP?#", reply))
+    if (m_Protocol.query("TEMP?#", reply))
     {
         json doc;
         try{
@@ -990,7 +614,7 @@ bool StarpointFocuser::readTemperature()
         catch (const json::exception &e)
         {
             LOGF_DEBUG("TEMP? => %s (%s)", printable(reply).c_str(), e.what());
-            m_LastError = "The focuser gave an unexpected reply.";
+            m_Protocol.setLastError("The focuser gave an unexpected reply.");
             return false;
         }
 
@@ -998,13 +622,13 @@ bool StarpointFocuser::readTemperature()
         if (availableField == nullptr || !availableField->is_boolean())
         {
             LOGF_DEBUG("TEMP? -> %s", printable(reply).c_str());
-            m_LastError = "The focuser gave an unexpected reply.";
+            m_Protocol.setLastError("The focuser gave an unexpected reply.");
             return false;
         }
 
         available = availableField->get<bool>() && numberField(doc, "tempC", celsius);
     }
-    else if (!m_LastRefused)
+    else if (!m_Protocol.lastRefused())
         return false;
 
     // A refused TEMP? counts as no reading
@@ -1051,7 +675,7 @@ bool StarpointFocuser::poll()
 {
     // MOVING? first. Once it says stopped, the position read next is final.
     int32_t moving = 0, position = 0;
-    if (!queryInteger("MOVING?#", moving) || !queryInteger("POS?#", position))
+    if (!m_Protocol.queryInteger("MOVING?#", moving) || !m_Protocol.queryInteger("POS?#", position))
         return false;
 
     if (std::chrono::steady_clock::now() - m_TemperatureReadAt >= TEMPERATURE_INTERVAL && !readTemperature())
@@ -1099,11 +723,11 @@ bool StarpointFocuser::poll()
 void StarpointFocuser::pollFailed()
 {
     m_FailedPolls++;
-    LOGF_DEBUG("Poll failed (%d in a row): %s", m_FailedPolls, m_LastError.c_str());
+    LOGF_DEBUG("Poll failed (%d in a row): %s", m_FailedPolls, m_Protocol.lastError().c_str());
 
     if (m_FailedPolls == FAILED_POLLS_BEFORE_LOST)
     {
-        LOGF_ERROR("Lost contact with the focuser. %s Check its USB cable and power. If it does not recover, disconnect and connect again.", m_LastError.c_str());
+        LOGF_ERROR("Lost contact with the focuser. %s Check its USB cable and power. If it does not recover, disconnect and connect again.", m_Protocol.lastError().c_str());
         FocusAbsPosNP.setState(IPS_ALERT);
         FocusAbsPosNP.apply();
         FocusRelPosNP.setState(IPS_ALERT);
@@ -1162,9 +786,9 @@ bool StarpointFocuser::setLimits(int32_t minimum, int32_t maximum)
         if (value == current)
             continue;
 
-        if (!sendCommand(std::string(isMaximum ? "MAX" : "MIN") + std::to_string(value) + "#"))
+        if (!m_Protocol.sendCommand(std::string(isMaximum ? "MAX" : "MIN") + std::to_string(value) + "#"))
         {
-            LOGF_ERROR("Could not change the %s position. %s", isMaximum ? "maximum" : "minimum", m_LastError.c_str());
+            LOGF_ERROR("Could not change the %s position. %s", isMaximum ? "maximum" : "minimum", m_Protocol.lastError().c_str());
             updateLimitProperties();
             return false;
         }
@@ -1182,9 +806,9 @@ bool StarpointFocuser::setLED(int index)
     if (index < 0)
         return false;
 
-    if (!sendCommand("LED" + std::to_string(LED_LEVELS[index]) + "#"))
+    if (!m_Protocol.sendCommand("LED" + std::to_string(LED_LEVELS[index]) + "#"))
     {
-        LOGF_ERROR("Could not change the status light brightness level. %s", m_LastError.c_str());
+        LOGF_ERROR("Could not change the status light brightness level. %s", m_Protocol.lastError().c_str());
         return false;
     }
 
@@ -1196,7 +820,7 @@ bool StarpointFocuser::calibrateTemperature(double actual)
 {
     if (!readTemperature())
     {
-        LOGF_ERROR("Could not read the focuser's temperature. %s", m_LastError.c_str());
+        LOGF_ERROR("Could not read the focuser's temperature. %s", m_Protocol.lastError().c_str());
         return false;
     }
 
@@ -1220,9 +844,9 @@ bool StarpointFocuser::calibrateTemperature(double actual)
 
 bool StarpointFocuser::setTemperatureOffset(double offset)
 {
-    if (!sendCommand("TEMPOFFSET" + formatOffset(offset) + "#"))
+    if (!m_Protocol.sendCommand("TEMPOFFSET" + formatOffset(offset) + "#"))
     {
-        LOGF_ERROR("Could not set the temperature offset. %s", m_LastError.c_str());
+        LOGF_ERROR("Could not set the temperature offset. %s", m_Protocol.lastError().c_str());
         TemperatureOffsetNP.setState(IPS_ALERT);
         TemperatureOffsetNP.apply();
         return false;
