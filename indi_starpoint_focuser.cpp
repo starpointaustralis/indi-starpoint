@@ -67,6 +67,15 @@ namespace
 
     const std::string FOCUSER_REPLY = "FOUND1982";
 
+    // The focuser's Bluetooth LE services: commands go to the transmit characteristic and replies
+    // come back as notifications on the receive characteristic
+    const StarpointBluetoothLink::Profile BLUETOOTH_PROFILE = 
+    {
+        "focuser",
+        "019163f5-e364-728c-b7ab-68ad229cc2a2", "019163ea-728c-717d-beaf-5f7189ba85e2",
+        "019163e4-e656-7e07-af4f-b645cc34d96e", "019163e5-db4b-777b-b4a6-7fcd6c1341ba"
+    };
+
     // LED brightness as the firmware's raw values: Off, Low, Medium, High
     constexpr int LED_LEVELS[] = {0, 10, 80, 150};
 
@@ -113,7 +122,7 @@ namespace
         if (error == "unsupported")
             return "The focuser's firmware does not support this command.";
         if (error == "security_required")
-            return "The focuser refused this for security reasons.";
+            return "The focuser needs a paired Bluetooth connection for this. Disconnect, then connect again to pair.";
         if (error == "busy")
             return "The focuser is busy and refused the command. Try again in a moment.";
         return "The focuser refused the command.";
@@ -250,6 +259,17 @@ bool StarpointFocuser::initProperties()
     INDI::Focuser::initProperties();
 
     serialConnection->setDefaultBaudRate(Connection::Serial::B_115200);
+
+    m_BluetoothConnection = new StarpointBluetoothConnection(this, BLUETOOTH_PROFILE);
+    m_BluetoothConnection->registerHandshake([&]()
+    {
+        return Handshake();
+    });
+    m_BluetoothConnection->registerSimulation([&]()
+    {
+        return isSimulation();
+    });
+    registerConnection(m_BluetoothConnection);
 
     FocusMaxPosNP[0].setMinMax(1, INT32_MAX);
     FocusMinPosNP[0].fill("FOCUS_MIN_VALUE", "Steps", "%.f", 0, INT32_MAX, 1000, 0);
@@ -405,9 +425,12 @@ bool StarpointFocuser::ISNewSwitch(const char *dev, const char *name, ISState *s
 
 bool StarpointFocuser::Handshake()
 {
-    const std::string port = isSimulation() ? std::string("simulator") : std::string(serialConnection->port());
-
+    std::string port = "simulator";
     if (!isSimulation())
+        port = usingBluetooth() ? "Bluetooth " + m_BluetoothConnection->address() : std::string(serialConnection->port());
+
+    // Over USB, the focuser may have just restarted
+    if (!isSimulation() && !usingBluetooth())
     {
         std::this_thread::sleep_for(BOOT_DRAIN);
         discardInput();
@@ -746,6 +769,14 @@ bool StarpointFocuser::sendWithoutReply(const std::string &command)
     if (isSimulation())
         return true;
 
+    if (usingBluetooth())
+    {
+        if (m_BluetoothConnection->link().write(command))
+            return true;
+        m_LastError = m_BluetoothConnection->link().lastError();
+        return false;
+    }
+
     int written = 0;
     const int rc = tty_write_string(PortFD, command.c_str(), &written);
     if (rc != TTY_OK)
@@ -764,7 +795,9 @@ void StarpointFocuser::discardInput()
 {
     std::string discarded;
     char buffer[256];
-    for (;;)
+    if (usingBluetooth())
+        discarded = m_BluetoothConnection->link().takeReceived();
+    else for (;;)
     {
         int nread = 0;
         const int rc = tty_read_expanded(PortFD, buffer, sizeof(buffer), 0, 0, &nread);
@@ -778,6 +811,47 @@ void StarpointFocuser::discardInput()
         LOGF_DEBUG("Discarded [%s]", printable(discarded).c_str());
 }
 
+StarpointFocuser::Exchange StarpointFocuser::readByte(char &c, std::chrono::steady_clock::time_point deadline)
+{
+    if (usingBluetooth())
+    {
+        switch (m_BluetoothConnection->link().read(c, deadline))
+        {
+            case StarpointBluetoothLink::Read::OK:
+                return Exchange::OK;
+            case StarpointBluetoothLink::Read::TIMEOUT:
+                return Exchange::TIMEOUT;
+            case StarpointBluetoothLink::Read::LOST:
+                break;
+        }
+        m_LastError = "Lost contact with the focuser over Bluetooth.";
+        return Exchange::FAILED;
+    }
+
+    const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
+    if (remaining <= 0)
+        return Exchange::TIMEOUT;
+
+    int nread = 0;
+    const int rc = tty_read_expanded(PortFD, &c, 1, remaining / 1000000, remaining % 1000000, &nread);
+    if (rc == TTY_TIME_OUT)
+        return Exchange::TIMEOUT;
+    if (rc != TTY_OK)
+    {
+        char message[MAXRBUF];
+        tty_error_msg(rc, message, MAXRBUF);
+        LOGF_DEBUG("Reading failed: %s", message);
+        m_LastError = "Could not read from the focuser.";
+        return Exchange::FAILED;
+    }
+    return Exchange::OK;
+}
+
+bool StarpointFocuser::usingBluetooth()
+{
+    return m_BluetoothConnection != nullptr && getActiveConnection() == m_BluetoothConnection;
+}
+
 StarpointFocuser::Exchange StarpointFocuser::readReply(std::string &reply)
 {
     // Replies end in '#' and have no line breaks. Boot and crash logs have line breaks and no
@@ -786,23 +860,10 @@ StarpointFocuser::Exchange StarpointFocuser::readReply(std::string &reply)
     std::string pending;
     for (;;)
     {
-        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
-        if (remaining <= 0)
-            return Exchange::TIMEOUT;
-
         char c = 0;
-        int nread = 0;
-        const int rc = tty_read_expanded(PortFD, &c, 1, remaining / 1000000, remaining % 1000000, &nread);
-        if (rc == TTY_TIME_OUT)
-            return Exchange::TIMEOUT;
-        if (rc != TTY_OK)
-        {
-            char message[MAXRBUF];
-            tty_error_msg(rc, message, MAXRBUF);
-            LOGF_DEBUG("Reading failed: %s", message);
-            m_LastError = "Could not read from the focuser.";
-            return Exchange::FAILED;
-        }
+        const Exchange result = readByte(c, deadline);
+        if (result != Exchange::OK)
+            return result;
 
         if (c == '#')
         {

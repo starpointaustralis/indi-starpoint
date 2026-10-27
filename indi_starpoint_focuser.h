@@ -22,6 +22,7 @@
 #pragma once
 
 #include "indifocuser.h"
+#include "starpoint_bluetooth.h"
 
 #include <chrono>
 #include <cstdint>
@@ -76,6 +77,8 @@ class StarpointFocuser : public INDI::Focuser
         bool sendWithoutReply(const std::string &command);
         void discardInput();
         Exchange readReply(std::string &reply);
+        Exchange readByte(char &c, std::chrono::steady_clock::time_point deadline);
+        bool usingBluetooth();
 
         // Focuser state
         bool readConfig();
@@ -89,7 +92,7 @@ class StarpointFocuser : public INDI::Focuser
         bool calibrateTemperature(double actual);
         bool setTemperatureOffset(double offset);
 
-
+        StarpointBluetoothConnection *m_BluetoothConnection {nullptr};
         std::string m_LastError;
         bool m_LastRefused {false};
 

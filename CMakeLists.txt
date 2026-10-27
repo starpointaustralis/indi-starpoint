@@ -7,6 +7,11 @@ include(GNUInstallDirs)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules/")
 
 find_package(INDI 2.0 COMPONENTS driver REQUIRED)
+
+# Bluetooth goes through BlueZ on the system's D-Bus, with systemd's sd-bus
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
+
 if(NOT INDI_JSONLIB)
     find_package(nlohmann_json 3 REQUIRED)
     add_definitions(-D_USE_SYSTEM_JSONLIB)
@@ -35,11 +40,13 @@ include(CMakeCommon)
 add_executable(
     indi_starpoint_focuser
     indi_starpoint_focuser.cpp
+    starpoint_bluetooth.cpp
 )
 
 target_link_libraries(
     indi_starpoint_focuser
     ${INDI_LIBRARIES}
+    PkgConfig::SYSTEMD
 )
 
 install(TARGETS indi_starpoint_focuser RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
