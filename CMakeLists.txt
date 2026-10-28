@@ -62,6 +62,20 @@ target_link_libraries(
     ${INDI_LIBRARIES}
 )
 
+# Filter wheel
+add_executable(
+    indi_starpoint_filterwheel
+    starpoint_filterwheel.cpp
+)
+
+target_link_libraries(
+    indi_starpoint_filterwheel
+    starpoint_common
+    ${INDI_LIBRARIES}
+)
+
+install(TARGETS indi_starpoint_filterwheel RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 install(TARGETS indi_starpoint_focuser RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 install(
