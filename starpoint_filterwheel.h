@@ -22,18 +22,21 @@
 #pragma once
 
 #include "indifilterwheel.h"
+#include "indipowerinterface.h"
 #include "starpoint_bluetooth.h"
 #include "starpoint_protocol.h"
 
 #include <chrono>
+#include <functional>
 #include <string>
 #include <vector>
 
 /**
  * Starpoint Australis filter wheels, over USB serial or Bluetooth LE. StarpointProtocol talks
  * to them; this class follows the wheel's state. The filter names are stored on the wheel.
+ * Wheels with power outputs, a dew heater or a weather sensor say so in their CONFIG? reply.
  */
-class StarpointFilterWheel : public INDI::FilterWheel
+class StarpointFilterWheel : public INDI::FilterWheel, public INDI::PowerInterface
 {
     public:
         StarpointFilterWheel();
@@ -43,6 +46,7 @@ class StarpointFilterWheel : public INDI::FilterWheel
         virtual bool initProperties() override;
         virtual bool updateProperties() override;
 
+        virtual bool ISNewNumber(const char *dev, const char *name, double values[], char *names[], int n) override;
         virtual bool ISNewText(const char *dev, const char *name, char *texts[], char *names[], int n) override;
         virtual bool ISNewSwitch(const char *dev, const char *name, ISState *states, char *names[], int n) override;
 
@@ -58,6 +62,10 @@ class StarpointFilterWheel : public INDI::FilterWheel
         virtual bool SetFilterNames() override;
         virtual bool GetFilterNames() override;
 
+        virtual bool SetPowerPort(size_t port, bool enabled) override;
+        virtual bool SetDewPort(size_t port, bool enabled, double dutyCycle) override;
+        virtual bool SetAutoDewEnabled(size_t port, bool enabled) override;
+
     private:
         bool usingBluetooth();
 
@@ -66,6 +74,16 @@ class StarpointFilterWheel : public INDI::FilterWheel
         void pollFailed();
         bool isMoving() const;
         bool setLED(int index);
+
+        // Power outputs, dew heater and weather sensor
+        void switchEach(INDI::PropertySwitch &property, ISState *states, char *names[], int n,
+                        const std::function<bool(size_t, bool)> &set);
+        bool pollAuxiliary();
+        bool readPower();
+        bool readDewHeater();
+        bool readConditions();
+        bool setDewHeater(int mode, int duty);
+        void showDewHeater();
 
         StarpointBluetoothConnection *m_BluetoothConnection {nullptr};
         StarpointProtocol m_Protocol;
@@ -81,6 +99,14 @@ class StarpointFilterWheel : public INDI::FilterWheel
         int m_TimerID {-1};
 
         bool m_HasLED {false};
+
+        bool m_HasPower {false};
+        bool m_HasDewHeater {false};
+        bool m_HasConditions {false};
+        bool m_ConditionsAvailable {false};
+        int m_DewMode {0};
+        int m_DewDuty {0};
+        std::chrono::steady_clock::time_point m_AuxiliaryPolledAt;
 
         INDI::PropertyText DeviceInfoTP {3};
         enum
@@ -99,6 +125,15 @@ class StarpointFilterWheel : public INDI::FilterWheel
             LED_HIGH
         };
 
+        INDI::PropertyNumber ConditionsNP {4};
+        enum
+        {
+            CONDITIONS_TEMPERATURE,
+            CONDITIONS_HUMIDITY,
+            CONDITIONS_PRESSURE,
+            CONDITIONS_DEW_POINT
+        };
+
         class Simulator
         {
             public:
@@ -113,6 +148,11 @@ class StarpointFilterWheel : public INDI::FilterWheel
                 int m_Target {0};
                 int m_LED {10};
                 std::chrono::steady_clock::time_point m_MoveEndsAt;
+
+                // A wheel with power outputs, a dew heater and a weather sensor
+                bool m_Outputs[2] {true, false};
+                int m_DewMode {2};
+                int m_DewDuty {30};
         };
 
         Simulator m_Simulator;

@@ -50,6 +50,9 @@ namespace
     constexpr uint32_t IDLE_POLL_MS = 2000;
     constexpr int FAILED_POLLS_BEFORE_LOST = 3;
 
+    // Power, dew heater and conditions are read this often while the wheel is still
+    constexpr auto AUXILIARY_POLL = std::chrono::seconds(5);
+
     // A move has finished when the wheel reports the slot it was sent to, or after this long
     constexpr auto MOVE_TIMEOUT = std::chrono::seconds(30);
 
@@ -85,11 +88,33 @@ namespace
     {
         return "Filter " + std::to_string(slot + 1);
     }
+
+    // Power outputs 1 and 2, which the wheel calls A and B
+    constexpr int POWER_OUTPUTS = 2;
+
+    // The dew heater's modes, as DEWMODE numbers them
+    enum DewMode
+    {
+        DEW_OFF,
+        DEW_MANUAL,
+        DEW_AUTO
+    };
+
+    const char *const DEW_MODE_NAMES[] = {"off", "manual", "automatic"};
+
+    constexpr int MAX_DEW_DUTY = 100;
+
+    // Whether the wheel's CONFIG? capabilities include one, such as "dewHeater"
+    bool hasCapability(const json *capabilities, const char *name)
+    {
+        const json *field = capabilities != nullptr ? findField(*capabilities, name) : nullptr;
+        return field != nullptr && field->is_boolean() && field->get<bool>();
+    }
 }
 
 static std::unique_ptr<StarpointFilterWheel> starpointFilterWheel(new StarpointFilterWheel());
 
-StarpointFilterWheel::StarpointFilterWheel() : m_Protocol(this, "filter wheel")
+StarpointFilterWheel::StarpointFilterWheel() : INDI::PowerInterface(this), m_Protocol(this, "filter wheel")
 {
     m_Protocol.setRoute(
     {
@@ -149,6 +174,16 @@ bool StarpointFilterWheel::initProperties()
     LEDSP[LED_HIGH].fill("LED_HIGH", "High", ISS_OFF);
     LEDSP.fill(getDeviceName(), "LED_BRIGHTNESS", "Status Light", OPTIONS_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
 
+    // Two power outputs and one dew heater, with automatic control. Whether a wheel has them is
+    // only known once connected.
+    PI::initProperties(POWER_TAB, POWER_OUTPUTS, 1, 0, 1, 0);
+
+    ConditionsNP[CONDITIONS_TEMPERATURE].fill("TEMPERATURE", "Temperature (C)", "%.1f", -100, 100, 0, 0);
+    ConditionsNP[CONDITIONS_HUMIDITY].fill("HUMIDITY", "Humidity (%)", "%.0f", 0, 100, 0, 0);
+    ConditionsNP[CONDITIONS_PRESSURE].fill("PRESSURE", "Pressure (hPa)", "%.1f", 0, 2000, 0, 0);
+    ConditionsNP[CONDITIONS_DEW_POINT].fill("DEW_POINT", "Dew Point (C)", "%.1f", -100, 100, 0, 0);
+    ConditionsNP.fill(getDeviceName(), "CONDITIONS", "Conditions", DEW_TAB, IP_RO, 60, IPS_IDLE);
+
     // Debug, simulation and configuration controls
     addAuxControls();
 
@@ -159,31 +194,104 @@ bool StarpointFilterWheel::updateProperties()
 {
     INDI::FilterWheel::updateProperties();
 
+    // INDI::PowerInterface::updateProperties would also define over-voltage protection and power
+    // off on disconnect, which the wheel does not have, so the power properties are defined here
     if (isConnected())
     {
         defineProperty(DeviceInfoTP);
         if (m_HasLED)
             defineProperty(LEDSP);
+        if (m_HasPower)
+        {
+            defineProperty(PowerSensorsNP);
+            defineProperty(PowerChannelsSP);
+            defineProperty(PowerChannelCurrentNP);
+            defineProperty(PowerChannelLabelsTP);
+        }
+        if (m_HasDewHeater)
+        {
+            defineProperty(DewChannelsSP);
+            defineProperty(DewChannelDutyCycleNP);
+            defineProperty(AutoDewSP);
+            defineProperty(DewChannelLabelsTP);
+        }
+        if (m_HasConditions)
+            defineProperty(ConditionsNP);
     }
     else
     {
         deleteProperty(DeviceInfoTP);
         if (m_HasLED)
             deleteProperty(LEDSP);
+        if (m_HasPower)
+        {
+            deleteProperty(PowerSensorsNP);
+            deleteProperty(PowerChannelsSP);
+            deleteProperty(PowerChannelCurrentNP);
+            deleteProperty(PowerChannelLabelsTP);
+        }
+        if (m_HasDewHeater)
+        {
+            deleteProperty(DewChannelsSP);
+            deleteProperty(DewChannelDutyCycleNP);
+            deleteProperty(AutoDewSP);
+            deleteProperty(DewChannelLabelsTP);
+        }
+        if (m_HasConditions)
+            deleteProperty(ConditionsNP);
     }
 
     return true;
 }
 
-bool StarpointFilterWheel::ISNewText(const char *dev, const char *name, char *texts[], char *names[], int n)
+bool StarpointFilterWheel::ISNewNumber(const char *dev, const char *name, double values[], char *names[], int n)
 {
-    // INDI::FilterWheel passes a rename that failed on to INDI::DefaultDevice, which would keep
-    // the rejected names. Stop once the filter interface has handled it
-    if (dev != nullptr && strcmp(dev, getDeviceName()) == 0 && FilterNameTP.isNameMatch(name))
+    if (dev != nullptr && strcmp(dev, getDeviceName()) == 0 && DewChannelDutyCycleNP.isNameMatch(name))
     {
-        FilterInterface::processText(dev, name, texts, names, n);
+        // The wheel stores its dew heater setting. A copy in INDI's configuration must not change
+        // it when the configuration is loaded.
+        if (isConfigLoading())
+            return true;
+
+        // While the heater is off, the duty cycle is kept for when it is turned on. INDI rejects
+        // a value outside 0 to 100%.
+        const double previous = DewChannelDutyCycleNP[0].getValue();
+        if (!DewChannelDutyCycleNP.update(values, names, n))
+            DewChannelDutyCycleNP.setState(IPS_ALERT);
+        else if (DewChannelsSP[0].getState() == ISS_OFF || SetDewPort(0, true, DewChannelDutyCycleNP[0].getValue()))
+            DewChannelDutyCycleNP.setState(IPS_OK);
+        else
+        {
+            DewChannelDutyCycleNP[0].setValue(previous);
+            DewChannelDutyCycleNP.setState(IPS_ALERT);
+        }
+        DewChannelDutyCycleNP.apply();
         return true;
     }
+
+    return INDI::FilterWheel::ISNewNumber(dev, name, values, names, n);
+}
+
+bool StarpointFilterWheel::ISNewText(const char *dev, const char *name, char *texts[], char *names[], int n)
+{
+    // Renames are handled here: INDI::FilterWheel passes one that failed on to INDI::DefaultDevice,
+    // which would keep the rejected names, and adds a second, vaguer error message
+    if (dev != nullptr && strcmp(dev, getDeviceName()) == 0 && FilterNameTP.isNameMatch(name))
+    {
+        // The wheel stores its filter names. A copy in INDI's configuration must not change them
+        // when the configuration is loaded.
+        if (isConfigLoading())
+            return true;
+
+        FilterNameTP.update(texts, names, n);
+        FilterNameTP.setState(SetFilterNames() ? IPS_OK : IPS_ALERT);
+        FilterNameTP.apply();
+        return true;
+    }
+
+    // Labels for the power outputs and the dew heater, which INDI's configuration keeps
+    if (PI::processText(dev, name, texts, names, n))
+        return true;
 
     return INDI::FilterWheel::ISNewText(dev, name, texts, names, n);
 }
@@ -207,6 +315,38 @@ bool StarpointFilterWheel::ISNewSwitch(const char *dev, const char *name, ISStat
         return true;
     }
 
+    if (dev != nullptr && strcmp(dev, getDeviceName()) == 0
+            && (PowerChannelsSP.isNameMatch(name) || DewChannelsSP.isNameMatch(name) || AutoDewSP.isNameMatch(name)))
+    {
+        // The wheel stores its outputs and dew heater setting. A copy in INDI's configuration must
+        // not change them when the configuration is loaded.
+        if (isConfigLoading())
+            return true;
+
+        if (PowerChannelsSP.isNameMatch(name))
+        {
+            switchEach(PowerChannelsSP, states, names, n, [this](size_t port, bool on)
+            {
+                return SetPowerPort(port, on);
+            });
+        }
+        else if (DewChannelsSP.isNameMatch(name))
+        {
+            switchEach(DewChannelsSP, states, names, n, [this](size_t port, bool on)
+            {
+                return SetDewPort(port, on, DewChannelDutyCycleNP[port].getValue());
+            });
+        }
+        else
+        {
+            switchEach(AutoDewSP, states, names, n, [this](size_t port, bool on)
+            {
+                return SetAutoDewEnabled(port, on);
+            });
+        }
+        return true;
+    }
+
     return INDI::FilterWheel::ISNewSwitch(dev, name, states, names, n);
 }
 
@@ -221,6 +361,13 @@ bool StarpointFilterWheel::Handshake()
 
     if (!readConfig())
         return false;
+
+    if (!pollAuxiliary())
+    {
+        LOGF_ERROR("Could not read the filter wheel's power outputs, dew heater or weather sensor. %s",
+                   m_Protocol.lastError().c_str());
+        return false;
+    }
 
     m_FailedPolls = 0;
     m_LastPollAt = std::chrono::steady_clock::now();
@@ -242,6 +389,11 @@ bool StarpointFilterWheel::saveConfigItems(FILE *fp)
     // itself, and loading an old copy would turn the wheel or rename its filters
     INDI::DefaultDevice::saveConfigItems(fp);
     controller->saveConfigItems(fp);
+
+    // Of INDI::PowerInterface's settings, only the labels. The wheel stores its outputs and dew
+    // heater setting.
+    PowerChannelLabelsTP.save(fp);
+    DewChannelLabelsTP.save(fp);
     return true;
 }
 
@@ -358,6 +510,38 @@ bool StarpointFilterWheel::GetFilterNames()
     return true;
 }
 
+bool StarpointFilterWheel::SetPowerPort(size_t port, bool enabled)
+{
+    // INDI's outputs 1 and 2 are the wheel's outputs A and B
+    const int output = static_cast<int>(port) + 1;
+    const std::string command = std::string("OUT") + (port == 0 ? "A" : "B") + "ENABLE" + (enabled ? "1" : "0") + "#";
+    if (!m_Protocol.sendCommand(command))
+    {
+        LOGF_ERROR("Could not switch power output %d %s. %s", output, enabled ? "on" : "off", m_Protocol.lastError().c_str());
+        return false;
+    }
+
+    LOGF_INFO("Power output %d switched %s.", output, enabled ? "on" : "off");
+
+    // Its readings follow on the next poll
+    m_AuxiliaryPolledAt = {};
+    return true;
+}
+
+bool StarpointFilterWheel::SetDewPort(size_t port, bool enabled, double dutyCycle)
+{
+    // The wheel has one dew heater. On is its manual mode, at the duty cycle asked for.
+    INDI_UNUSED(port);
+    return setDewHeater(enabled ? DEW_MANUAL : DEW_OFF, static_cast<int>(std::lround(dutyCycle)));
+}
+
+bool StarpointFilterWheel::SetAutoDewEnabled(size_t port, bool enabled)
+{
+    // Turning automatic off leaves the heater on, in manual mode at the duty cycle shown
+    INDI_UNUSED(port);
+    return setDewHeater(enabled ? DEW_AUTO : DEW_MANUAL, static_cast<int>(std::lround(DewChannelDutyCycleNP[0].getValue())));
+}
+
 bool StarpointFilterWheel::usingBluetooth()
 {
     return m_BluetoothConnection != nullptr && getActiveConnection() == m_BluetoothConnection;
@@ -435,6 +619,23 @@ bool StarpointFilterWheel::readConfig()
         LEDSP.setState(IPS_OK);
     }
 
+    // Power outputs, a dew heater and a weather sensor, on wheels that have them
+    const json *capabilities = findField(config, "capabilities");
+    m_HasPower = hasCapability(capabilities, "powerMonitor");
+    m_HasDewHeater = hasCapability(capabilities, "dewHeater");
+    m_HasConditions = hasCapability(capabilities, "weather");
+    m_ConditionsAvailable = true;
+    m_AuxiliaryPolledAt = {};
+
+    uint32_t power = 0;
+    if (m_HasPower)
+        power |= POWER_HAS_DC_OUT | POWER_HAS_VOLTAGE_SENSOR | POWER_HAS_OVERALL_CURRENT | POWER_HAS_PER_PORT_CURRENT;
+    if (m_HasDewHeater)
+        power |= POWER_HAS_DEW_OUT | POWER_HAS_AUTO_DEW;
+    SetCapability(power);
+    setDriverInterface(FILTER_INTERFACE | (power != 0 ? POWER_INTERFACE : 0));
+    syncDriverInfo();
+
     FilterSlotNP[0].setMinMax(1, m_Slots);
     FilterSlotNP[0].setValue(m_Position >= 0 ? m_Position + 1 : 1);
     FilterSlotNP.setState(m_Position >= 0 ? IPS_OK : IPS_BUSY);
@@ -448,6 +649,8 @@ bool StarpointFilterWheel::readConfig()
                   m_Slots);
     for (int i = 0; i < m_Slots; i++)
         LOGF_DEBUG("Slot %d: %s", i + 1, m_Names[i].c_str());
+    LOGF_DEBUG("Power outputs: %s. Dew heater: %s. Weather sensor: %s.", m_HasPower ? "yes" : "no",
+               m_HasDewHeater ? "yes" : "no", m_HasConditions ? "yes" : "no");
     return true;
 }
 
@@ -487,6 +690,10 @@ bool StarpointFilterWheel::poll()
         SelectFilterDone(position + 1);
     }
 
+    // Power, dew heater and conditions, while the wheel is still
+    if (!isMoving() && std::chrono::steady_clock::now() - m_AuxiliaryPolledAt >= AUXILIARY_POLL)
+        return pollAuxiliary();
+
     return true;
 }
 
@@ -525,6 +732,234 @@ bool StarpointFilterWheel::setLED(int index)
     return true;
 }
 
+// Makes the changes a client sent to a set of switches, one switch at a time, matched by name.
+// INDI::PowerInterface would match them by position, which goes wrong when a client sends only
+// some of them, and would save them in INDI's configuration, though the wheel stores them.
+void StarpointFilterWheel::switchEach(INDI::PropertySwitch &property, ISState *states, char *names[], int n,
+                                      const std::function<bool(size_t, bool)> &set)
+{
+    bool ok = true;
+    for (size_t i = 0; i < property.size(); i++)
+    {
+        for (int j = 0; j < n; j++)
+        {
+            if (!property[i].isNameMatch(names[j]) || property[i].getState() == states[j])
+                continue;
+
+            if (set(i, states[j] == ISS_ON))
+                property[i].setState(states[j]);
+            else
+                ok = false;
+        }
+    }
+
+    property.setState(ok ? IPS_OK : IPS_ALERT);
+    property.apply();
+}
+
+// Power, dew heater and conditions, for those the wheel has
+bool StarpointFilterWheel::pollAuxiliary()
+{
+    m_AuxiliaryPolledAt = std::chrono::steady_clock::now();
+    return (!m_HasPower || readPower()) && (!m_HasDewHeater || readDewHeater()) && (!m_HasConditions || readConditions());
+}
+
+bool StarpointFilterWheel::readPower()
+{
+    std::string reply;
+    if (!m_Protocol.query("POWER?#", reply))
+        return false;
+
+    json power;
+    try
+    {
+        power = json::parse(withoutNonNumbers(reply));
+    }
+    catch (const json::exception &e)
+    {
+        LOGF_DEBUG("POWER? -> %s (%s)", printable(reply).c_str(), e.what());
+        m_Protocol.setLastError("The filter wheel gave an unexpected reply.");
+        return false;
+    }
+
+    // The input, which is always on
+    double value = 0;
+    const json *input = findField(power, "input");
+    if (input != nullptr)
+    {
+        if (numberField(*input, "voltage", value))
+            PowerSensorsNP[SENSOR_VOLTAGE].setValue(value);
+        if (numberField(*input, "current", value))
+            PowerSensorsNP[SENSOR_CURRENT].setValue(value);
+        if (numberField(*input, "powerW", value))
+            PowerSensorsNP[SENSOR_POWER].setValue(value);
+    }
+    PowerSensorsNP.setState(IPS_OK);
+
+    // The outputs, "out1" and "out2"
+    bool switched = false;
+    for (int i = 0; i < POWER_OUTPUTS; i++)
+    {
+        const json *output = findField(power, ("out" + std::to_string(i + 1)).c_str());
+        if (output == nullptr)
+            continue;
+
+        if (numberField(*output, "current", value))
+            PowerChannelCurrentNP[i].setValue(value);
+
+        const json *enabled = findField(*output, "enabled");
+        if (enabled != nullptr && enabled->is_boolean())
+        {
+            const ISState state = enabled->get<bool>() ? ISS_ON : ISS_OFF;
+            switched = switched || PowerChannelsSP[i].getState() != state;
+            PowerChannelsSP[i].setState(state);
+        }
+    }
+    PowerChannelCurrentNP.setState(IPS_OK);
+    PowerChannelsSP.setState(IPS_OK);
+
+    // While connecting, updateProperties defines the properties afterwards
+    if (!isConnected())
+        return true;
+
+    PowerSensorsNP.apply();
+    PowerChannelCurrentNP.apply();
+    if (switched)
+        PowerChannelsSP.apply();
+    return true;
+}
+
+bool StarpointFilterWheel::readDewHeater()
+{
+    int32_t mode = 0, duty = 0;
+    if (!m_Protocol.queryInteger("DEWMODE?#", mode) || !m_Protocol.queryInteger("DEWDUTY?#", duty))
+        return false;
+
+    // A mode the driver does not know counts as off, as in the Starpoint Hub
+    if (mode != DEW_MANUAL && mode != DEW_AUTO)
+        mode = DEW_OFF;
+    duty = std::clamp(duty, 0, MAX_DEW_DUTY);
+
+    // In automatic mode the wheel changes the duty cycle as it goes, so this is only for debugging
+    if (mode != m_DewMode || duty != m_DewDuty)
+        LOGF_DEBUG("Dew heater %s, at %d%%.", DEW_MODE_NAMES[mode], duty);
+
+    m_DewMode = mode;
+    m_DewDuty = duty;
+    showDewHeater();
+    return true;
+}
+
+bool StarpointFilterWheel::readConditions()
+{
+    std::string reply;
+    if (!m_Protocol.query("WEATHER?#", reply))
+        return false;
+
+    json weather;
+    try
+    {
+        weather = json::parse(withoutNonNumbers(reply));
+    }
+    catch (const json::exception &e)
+    {
+        LOGF_DEBUG("WEATHER? -> %s (%s)", printable(reply).c_str(), e.what());
+        m_Protocol.setLastError("The filter wheel gave an unexpected reply.");
+        return false;
+    }
+
+    const json *availableField = findField(weather, "available");
+    if (availableField == nullptr || !availableField->is_boolean())
+    {
+        LOGF_DEBUG("WEATHER? -> %s", printable(reply).c_str());
+        m_Protocol.setLastError("The filter wheel gave an unexpected reply.");
+        return false;
+    }
+
+    const bool available = availableField->get<bool>();
+    if (available)
+    {
+        double value = 0;
+        if (numberField(weather, "tempC", value))
+            ConditionsNP[CONDITIONS_TEMPERATURE].setValue(value);
+        if (numberField(weather, "humidity", value))
+            ConditionsNP[CONDITIONS_HUMIDITY].setValue(value);
+        if (numberField(weather, "pressureHpa", value))
+            ConditionsNP[CONDITIONS_PRESSURE].setValue(value);
+        if (numberField(weather, "dewPointC", value))
+            ConditionsNP[CONDITIONS_DEW_POINT].setValue(value);
+    }
+    ConditionsNP.setState(available ? IPS_OK : IPS_ALERT);
+
+    if (available && !m_ConditionsAvailable)
+        LOG_INFO("The filter wheel's weather sensor is reading again.");
+    else if (!available && m_ConditionsAvailable)
+        LOG_WARN("The filter wheel's weather sensor has no reading.");
+    m_ConditionsAvailable = available;
+
+    // While connecting, updateProperties defines the property afterwards
+    if (isConnected())
+        ConditionsNP.apply();
+    return true;
+}
+
+// Sets the wheel's dew heater mode, and in manual mode its duty cycle
+bool StarpointFilterWheel::setDewHeater(int mode, int duty)
+{
+    // Read it back soon, whether or not this works
+    m_AuxiliaryPolledAt = {};
+
+    if (!m_Protocol.sendCommand("DEWMODE" + std::to_string(mode) + "#"))
+    {
+        LOGF_ERROR("Could not set the dew heater to %s. %s", DEW_MODE_NAMES[mode], m_Protocol.lastError().c_str());
+        return false;
+    }
+    m_DewMode = mode;
+
+    if (mode == DEW_MANUAL)
+    {
+        if (!m_Protocol.sendCommand("DEWDUTY" + std::to_string(duty) + "#"))
+        {
+            LOGF_ERROR("Could not set the dew heater to %d%%. %s", duty, m_Protocol.lastError().c_str());
+            return false;
+        }
+        m_DewDuty = duty;
+        LOGF_INFO("Dew heater on at %d%%.", duty);
+    }
+    else if (mode == DEW_AUTO)
+        LOG_INFO("Dew heater set to automatic.");
+    else
+        LOG_INFO("Dew heater off.");
+
+    showDewHeater();
+    return true;
+}
+
+// The wheel's dew heater mode as INDI's switches: the heater is on in manual and automatic modes.
+// While it is off, the duty cycle stays as last shown, for when it is turned on again.
+void StarpointFilterWheel::showDewHeater()
+{
+    DewChannelsSP[0].setState(m_DewMode != DEW_OFF ? ISS_ON : ISS_OFF);
+    AutoDewSP[0].setState(m_DewMode == DEW_AUTO ? ISS_ON : ISS_OFF);
+    DewChannelsSP.setState(IPS_OK);
+    AutoDewSP.setState(IPS_OK);
+    DewChannelDutyCycleNP.setState(IPS_OK);
+
+    // While connecting, show the wheel's duty cycle whatever the mode; updateProperties defines
+    // the properties afterwards
+    if (!isConnected())
+    {
+        DewChannelDutyCycleNP[0].setValue(m_DewDuty);
+        return;
+    }
+
+    if (m_DewMode != DEW_OFF)
+        DewChannelDutyCycleNP[0].setValue(m_DewDuty);
+    DewChannelsSP.apply();
+    AutoDewSP.apply();
+    DewChannelDutyCycleNP.apply();
+}
+
 std::string StarpointFilterWheel::Simulator::reply(const std::string &command)
 {
     update();
@@ -532,6 +967,9 @@ std::string StarpointFilterWheel::Simulator::reply(const std::string &command)
     const std::string body = withoutTerminator(command);
     const int slots = static_cast<int>(m_Names.size());
     const bool moving = m_Position != m_Target;
+
+    // In automatic mode the heater runs at 40%, for the conditions below
+    const int dewDuty = m_DewMode == DEW_AUTO ? 40 : m_DewDuty;
 
     // Commands that set something carry a number after their name
     double value = 0;
@@ -558,7 +996,7 @@ std::string StarpointFilterWheel::Simulator::reply(const std::string &command)
         {
             {"device", "Simulator"}, {"deviceName", "Simulated filter wheel"}, {"fw", "simulator"},
             {"positions", slots}, {"currentPosition", moving ? -1 : m_Position}, {"filters", filters},
-            {"capabilities", {{"powerMonitor", false}, {"dewHeater", false}, {"weather", false}, {"homing", false}}},
+            {"capabilities", {{"powerMonitor", true}, {"dewHeater", true}, {"weather", true}, {"homing", false}}},
             {"led", m_LED}
         };
         return config.dump();
@@ -566,6 +1004,33 @@ std::string StarpointFilterWheel::Simulator::reply(const std::string &command)
 
     if (body == "POS?")
         return std::to_string(moving ? -1 : m_Position);
+
+    if (body == "POWER?")
+    {
+        // Output 1 draws 0.9 A and output 2 0.5 A when on, and the heater up to 2 A
+        const double volts = 12.3;
+        const double outputs[POWER_OUTPUTS] = {m_Outputs[0] ? 0.9 : 0, m_Outputs[1] ? 0.5 : 0};
+        const double heater = m_DewMode == DEW_OFF ? 0 : 0.02 * dewDuty;
+        const double input = 0.12 + outputs[0] + outputs[1] + heater;
+
+        json power = {{"input", {{"voltage", volts}, {"current", input}, {"powerW", volts * input}}}};
+        for (int i = 0; i < POWER_OUTPUTS; i++)
+            power["out" + std::to_string(i + 1)] =
+            {
+                {"enabled", m_Outputs[i]}, {"voltage", m_Outputs[i] ? volts : 0}, {"current", outputs[i]},
+                {"powerW", volts * outputs[i]}
+            };
+        return power.dump();
+    }
+
+    if (body == "DEWMODE?")
+        return std::to_string(m_DewMode);
+
+    if (body == "DEWDUTY?")
+        return std::to_string(dewDuty);
+
+    if (body == "WEATHER?")
+        return R"({"available":true,"tempC":9.5,"tempF":49.1,"humidity":81.0,"pressureHpa":1008.2,"dewPointC":6.4,"dewPointF":43.5})";
 
     if (body.compare(0, 7, "FILNAME") == 0)
     {
@@ -605,6 +1070,33 @@ std::string StarpointFilterWheel::Simulator::reply(const std::string &command)
         if (value < 0 || value > 255)
             return ack(false, "range");
         m_LED = static_cast<int>(value);
+        return ack(true);
+    }
+
+    for (int i = 0; i < POWER_OUTPUTS; i++)
+    {
+        if (valueAfter(i == 0 ? "OUTAENABLE" : "OUTBENABLE"))
+        {
+            if (value != 0 && value != 1)
+                return ack(false, "range");
+            m_Outputs[i] = value == 1;
+            return ack(true);
+        }
+    }
+
+    if (valueAfter("DEWMODE"))
+    {
+        if (value != DEW_OFF && value != DEW_MANUAL && value != DEW_AUTO)
+            return ack(false, "range");
+        m_DewMode = static_cast<int>(value);
+        return ack(true);
+    }
+
+    if (valueAfter("DEWDUTY"))
+    {
+        if (value < 0 || value > MAX_DEW_DUTY)
+            return ack(false, "range");
+        m_DewDuty = static_cast<int>(value);
         return ack(true);
     }
 
